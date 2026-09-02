@@ -66,6 +66,8 @@ const MAX_FRAME_DELTA = 0.1;      // clamp so a backgrounded tab cannot burn eve
 // --- Input (GDD 1.4) ----------------------------------------------------------
 const SWIPE_THRESHOLD = 28;       // virtual px before a drag counts as a swipe
 const TAP_SLOP = 7;               // a release under this distance is a tap
+const INPUT_STALE = 6;            // seconds after which a pointer that never released is abandoned
+
 const HIT_MIN = 38;               // minimum hit box for a tappable target
 
 // --- Palette (GDD 12.1) -------------------------------------------------------
@@ -343,7 +345,9 @@ const CHEVRON_PLATE = 3;          // padding between the arrow and the edge of i
 // --- Souls, the queue and the card (GDD 5) ------------------------------------
 const QUEUE_MAX = 8;              // waiting souls; a further arrival turns away (GDD 5.4)
 const FIRST_ARRIVAL = 1.2;        // grace before the first soul of a day
-const LATE_DAY = 6;               // from here the weight of souls with Sanctity >= 4 doubles
+const LATE_DAY = 6;               // from here the weight of souls with Skepticism >= 4 doubles
+const LATE_SKEPTIC = 4;           // what counts as dangerous for that rule, in pips of Skepticism
+
 const GOOD_PERSON_DAY = 3;        // the rarest archetype only starts appearing this late
 
 const CARD_IN = 0.14;             // seconds the card takes to rise into the work zone
@@ -373,11 +377,110 @@ const DESK_BUST_X = 15;
 const QUEUE_FIGURE = { w: 10, h: 14, gap: 2 };
 
 // --- Production and feedback (GDD 4, 5.5, 10) ---------------------------------
-const AURA_PER_G = 0.4;           // Aura per second per point of Gullibility, upstairs only
-const CREDITS_PER_CUBICLE = 1.5;  // Credits per second from one soul in operations
-const DENY_COST = 4;              // Credits burned turning a soul away, clamped at zero
+// Both stats are five pips because the docket blank has five sockets per row (15e_art_card). The
+// constant exists because Skepticism is stored as its complement and a bare 5 in that subtraction
+// would be a magic number sitting on top of an art decision.
+const STAT_MAX = 5;
 
-const SNAP_TIME = 1.5;            // decide faster than this and the soul is worth more, forever
+// What each stat DOES, and the pairing is the whole design (GDD 5.1). Sanctity earns: a genuinely
+// holy guest in the lounge is what Head Office's instruments read, and it is the only thing the
+// daily quota can be paid in. Skepticism costs: a guest who is not buying it hears the office floor
+// through the marble, walks to the panoramic window, and starts asking. The two run together in the
+// roster - the holy are rarely the credulous - so the soul worth the most upstairs is the soul most
+// likely to get the place audited, and that is the dilemma the card is asking about.
+// 0.63 is what pool-average parity with the old AURA_PER_G asks for and it is NOT what the game
+// wanted: measured on 2 September, parity on the mean is not parity in play, because the roster
+// holds far less Sanctity than Gullibility and it is concentrated in four archetypes. A player can
+// no longer fill eight suites with earners - there are not enough - so gross production fell by
+// about a third at the same nominal rate, and the quota column had to follow it down rather than
+// the rate up. 0.70 is where a full lounge of what actually turns up covers a day.
+// 0.78 after the concierge came out (2 September). Its floor was the game's only Aura source that
+// did not depend on the quality of the soul, and removing it took roughly a third of a competent
+// lounge's output with it - so the rate came up and the quota column came down to meet it.
+const AURA_PER_S = 0.78;          // Aura per second per point of Sanctity, upstairs only
+
+
+
+// What a soul is worth at a desk, and why it is not one number any more. Until 2 September every
+// soul downstairs paid exactly 1.5/s, which meant the REASSIGN half of the card was the same
+// sentence on all thirteen archetypes: the docket printed "+1.5 ◈/s" whoever was standing on it, so
+// the only question the swipe ever asked was "is there a desk free". A floor that cannot be sorted
+// for is not a floor, it is a bin.
+//
+// It is priced on Gullibility, which is the stat the flip left with nothing to do: since 2 September
+// `g` is only read as its complement, to charge Skepticism upstairs. Operations is the sales floor -
+// what it bills is not the filing, it is the upsell, and who signs the upsell is the whole of what
+// Gullibility means. The card needs no new row for it: the docket has printed a per-floor rate under
+// each swipe since step 3, so the number simply stops being a constant.
+//
+// Base plus slope rather than a bare multiple, and the base is the load-bearing half. On a pure
+// slope the Conspiracy Podcaster (g0) earns nothing at a desk and nothing in a suite, which makes
+// roughly a sixth of the roster worth strictly less than the 16 ◈ it costs to refuse it with a slot
+// standing empty - and a card whose every answer is a loss is not a decision, it is a bill. The base
+// is the filing anyone can do; the slope is what they buy from the machine in the corridor.
+//
+// The pool's weighted average Gullibility is 2.50, so 0.5 + 0.4 x 2.50 lands the average soul on
+// exactly the old flat 1.5 and leaves the day tables, the shop prices and the quota column measuring
+// what they measured before. The spread is 0.5 to 2.5, five to one, and it is deliberately wide
+// enough to see on the docket: 0.9 against 2.1 is a rate the player has to squint at to prefer.
+const CREDITS_BASE = 0.5;         // Credits per second from any soul at a desk
+const CREDITS_PER_G = 0.4;        // ...plus this per point of Gullibility, which is what it buys
+// Refusing costs two different prices, because it is two different acts. With both floors full it
+// is a valve and has to stay usable - that is the price on the left. With somewhere to put the soul
+// it is a choice to run the resort emptier than it could be, and GDD 6 has said since the design
+// was written that this is what the full-lounge style is meant to be rewarded against. It was never
+// actually implemented: one flat price could not tell the two apart, so every attempt to make
+// refusing expensive hit the style that only refuses when it is full exactly as hard as the style
+// that refuses all day. Measured on 2 September: a flat rise to 14 took the balanced style from 7
+// wins in 24 to none, and left the filter ahead of it anyway.
+const DENY_COST = 4;              // Credits burned turning a soul away with nowhere to put it
+const DENY_COST_ROOM = 16;        // ...and with a suite or a desk standing empty
+
+
+// Repairing a wrecked suite (GDD 6.5). A riot leaves the suite it happened in unusable, and a
+// press-and-hold on that suite puts it back. Priced in thumb-time alone - no Credits, no
+// Suspicion: the queue keeps arriving through the hold and the card on the desk ages out of its
+// snap bonus, and that is the whole of the cost.
+//
+// This is the second thing the hold has been. The first was the concierge, which held an occupied
+// suite and made its guest present better to Head Office, and it failed for a reason that had
+// nothing to do with its numbers: there was never a moment at which not doing it was correct.
+// It was available on every guest, permanent once bought, and free, so the served flag ran at
+// roughly 40 of some 45 check-ins per run. A mechanic every player uses every time is not a
+// decision, it is a constant with a gesture in front of it - and it also handed the game to
+// whichever filter its shape happened to favour, twice, in two opposite directions (decisions
+// 113 and 123).
+
+//
+// A repair cannot become that, because THE GAME DECIDES WHEN IT IS OFFERED. A player who keeps up
+// never sees the gesture at all; a player who lets an expiry run out of desks sees it and has to
+// find the seconds. The thumb-time price finally bites, because it is charged exactly when the
+// player is already behind - which is the only moment in this game when seconds are genuinely
+// scarce. It also gives the riot the tail it never had: it used to be five points of the meter and
+// five seconds of slowed neighbours, forgotten by the eighth second.
+const SERVICE_HOLD = 1.2;         // seconds a finger must rest on a wrecked suite to put it back
+// And the bill, which is what actually gives the riot its tail. Thumb-time alone turned out to be
+// no tail at all: measured on 2 September, the basement style absorbed twelve riots a run and took
+// two audits, because a wreck cost it 1.2 seconds and a couple of seconds of one empty suite. A
+// suite costs 60 Credits and rises 35% a purchase, so a repair at 40 is most of the way to the next
+// one - which is the point. A riot now takes a guest, five points of the meter, the reputation, the
+// slot until it is paid for, AND the money that would have bought the capacity to stop the next
+// one. That is a consequence that compounds across a session rather than one that expires in five
+// seconds. Clamped like a refusal rather than blocked: a player with no Credits at all is already
+// having the worst run of their life, and a suite they can never reopen is a spiral, not a lesson.
+const REPAIR_COST = 40;           // Credits to put a wrecked suite back, clamped at zero
+// How the hold reports itself while the thumb is down (GDD 6.5). A press-and-hold is the one
+// gesture in this game that asks the player to wait, so it is the one gesture that has to show its
+// own progress - a finger resting on a suite with nothing moving under it reads as a suite that
+// does not answer, and the player lifts off before the 1.2 s are up. Two readouts, because they
+// answer two different questions: a band of clean light rising off the floor of the niche says
+// SOMETHING IS HAPPENING from the first frame, and the ring closing round the wreck's red outline
+// says HOW MUCH LONGER.
+const HOLD_FILL_ALPHA = 0.3;      // the rising band, over the empty niche
+
+
+const SNAP_TIME
+ = 1.5;            // decide faster than this and the soul is worth more, forever
 const SNAP_BONUS = 1.1;
 const SNAP_FROM_DAY = 2;          // day 1 is for reading the card, punishing that would be unfair
 const SNAP_FLASH = 0.9;           // how long the bonus announces itself
@@ -389,7 +492,7 @@ const POPUP_RISE = 18;
 const MAX_POPUPS = 24;            // a hard cap: 14 producers on a bad frame must not become a wall
 
 // --- The contract (GDD 6) -----------------------------------------------------
-const CONTRACT_TIME = 90;         // seconds a checked-in guest keeps producing (100 years, in-fiction)
+const CONTRACT_TIME = 70;         // seconds a checked-in guest keeps producing (100 years, in-fiction)
 const CONTRACT_WARN = 10;         // the ring pulses red for this long before it runs out
 const CONTRACT_PULSE = 1.5;       // Hz
 // Operations is a pipeline, not a landfill. A soul at a desk is filed away after this and the desk
@@ -466,9 +569,28 @@ const HALO_LIFT = 7;              // centre of the halo above the top edge of th
 // formula here is the GDD's, the rates are scaled to the length of an actual session, and the
 // balance pass (step 9) owns the final numbers.
 const SUSP_MAX = 100;
-const SUSP_SANCTITY_FREE = 1;     // one pip of Sanctity is tolerated; the meter only reads the rest
-const SUSP_PER_SANCTITY = 0.03;   // per second per point of Sanctity above that, upstairs only
+// Skepticism is a threshold rather than a slope, and the threshold sits at 2 rather than at 1
+// because the stat is a complement: an ordinary soul is Gullibility 2-3, which is Skepticism 2-3,
+// so a one-pip allowance would charge the meter for nearly everybody and the row of pips would stop
+// changing the answer. At 2 the pool's chargeable pips average 0.96 against the old stat's 0.84 and
+// 47% of the roster pays anything at all against the old 37% - the same shape, on the new axis.
+const SUSP_SKEPTIC_FREE = 2;      // two pips of Skepticism are tolerated; the meter reads the rest
+// The rate is a quarter of the old per-point figure, and that is arithmetic rather than mercy: the
+// old stat was paid by the souls a competent player refused, so the posted rate was rarely charged,
+// while this one is paid by the souls a competent player wants. At 0.03 every style in the sweep
+// died of an audit and none of the quota, which is one death condition wearing two names.
+const SUSP_PER_SKEPTIC = 0.008;   // per second per point of Skepticism above that, upstairs only
+
+
 const SUSP_PER_EXPIRED = 0.15;    // per second per expired guest still standing in a lounge slot
+// A wrecked suite is not only a slot the player cannot fill, it is a wrecked suite in a row of
+// suites with a panoramic corridor running past it. Without this the wreck costs nothing at all
+// while the lounge has room to spare, so a riot early in a day would be free until the lounge
+// filled and the repair would be something to get round to. With it, every wreck is asking for the
+// thumb from the second it appears. Deliberately well below the expired-guest rate: an expiry is
+// a person standing there asking questions, a wreck is furniture.
+const SUSP_PER_WRECK = 0.05;      // per second per wrecked lounge slot, until a thumb puts it back
+
 const NOISE_PER_SOUL = 0.035;     // per second per soul in operations, before dampening
 const SUSP_RIOT = 5;              // a guest walking out where the other guests can see it
 const SUSP_TURN_AWAY = 3;         // an arrival that found the queue full and left talking
@@ -603,12 +725,13 @@ const MAX_CUBICLES = 6;
 const DAYS = [
   { len: 55, interval: 6.0, quota: 110 },
   { len: 60, interval: 5.0, quota: 190 },
-  { len: 60, interval: 4.2, quota: 312 },
-  { len: 65, interval: 3.6, quota: 447 },
-  { len: 65, interval: 3.0, quota: 599 },
-  { len: 70, interval: 2.5, quota: 809 },
-  { len: 70, interval: 2.1, quota: 1122 },
-  { len: 90, interval: 1.6, quota: 1499 }
+  { len: 60, interval: 4.2, quota: 245 },
+  { len: 65, interval: 3.6, quota: 350 },
+  { len: 65, interval: 3.0, quota: 469 },
+  { len: 70, interval: 2.5, quota: 634 },
+  { len: 70, interval: 2.1, quota: 879 },
+  { len: 90, interval: 1.6, quota: 1175 }
+
 ];
 const LAST_DAY = DAYS.length;
 
@@ -1190,9 +1313,23 @@ function onPointerDown(e) {
   // that runs inside a real gesture handler, and the AudioContext can be created nowhere else
   // (see unlockAudio in 07_audio.js). A second finger is still a gesture.
   unlockAudio();
-  if (Input.pointerId !== null) return;          // single touch only, no multitouch anywhere
+  // Single touch only, no multitouch anywhere - unless the pointer holding the lock is stale, in
+  // which case it never released and this one takes over (see releaseStalePointer).
+  if (Input.pointerId !== null && !releaseStalePointer()) return;
+
+  // Capture is an optimisation, not a requirement - it keeps the move and up events coming when a
+  // finger slides off the canvas mid-swipe - so it is attempted, allowed to fail, and never allowed
+  // to take the gesture down with it.
+  //
+  // It used to be called AFTER the id was claimed and without a guard, and setPointerCapture throws
+  // NotFoundError whenever the pointer is no longer active by the time the handler runs. One throw
+  // left Input.pointerId set for good: every later pointerdown hit the multitouch guard above and
+  // returned, so the game went on animating - clouds drifting, contracts ticking, halos blinking -
+  // while every tap and every swipe did nothing at all. A dead input layer that looks like a
+  // running game is the worst failure this file can have, and it cost one line to make impossible.
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* proceed uncaptured */ }
   Input.pointerId = e.pointerId;
-  canvas.setPointerCapture(e.pointerId);
+
   const x = toVirtualX(e.clientX), y = toVirtualY(e.clientY);
   const d = Input.drag;
   d.active = true;
@@ -1236,7 +1373,32 @@ function onPointerUp(e) {
   e.preventDefault();
 }
 
+// The single-touch guard above needs a way out, because it is the one piece of state in the game
+// that a browser can strand. If a pointerup never arrives - the tab is backgrounded mid-touch, the
+// OS takes the gesture for its own edge swipe, the event is simply lost, all of which happen on
+// real phones - then Input.pointerId stays claimed and every later pointerdown returns at the
+// guard. The game goes on animating: clouds drift, contracts tick, halos blink, and nothing the
+// player does has any effect ever again. There is no way for them to recover it short of a reload,
+// and nothing on screen says so.
+//
+// pointercancel covers most of those cases and is not guaranteed to. So the drag is also given an
+// age, and a pointerdown arriving while the previous one is older than any real gesture takes over
+// instead of being refused. The threshold is far beyond anything a hand does - the longest
+// deliberate gesture in the game is the 1.2 s repair hold, and a lounge drag-scroll is under a
+// second - so this can only ever fire on a pointer that is genuinely gone.
+function updateInput(dt) {
+  if (Input.pointerId !== null) Input.drag.time += dt;
+}
+
+function releaseStalePointer() {
+  if (Input.pointerId === null || Input.drag.time <= INPUT_STALE) return false;
+  Input.drag.active = false;
+  Input.pointerId = null;
+  return true;
+}
+
 function onPointerCancel(e) {
+
   if (e.pointerId !== Input.pointerId) return;
   Input.drag.active = false;
   Input.pointerId = null;
@@ -1289,6 +1451,11 @@ const SFX_MAP = {
   shop:       'shop',
   suspicion:  'suspicion',
   relief:     'relief',
+  // The repair shares the relief cue rather than adding a twenty-third: both are "the resort
+
+  // just got easier", the bank is already baked, and a cue of its own is a sound-pass decision
+  // rather than a mechanic one.
+  serve:      'relief',
   lose:       'lose',
   // Three different ways of being told no, and one sound for all three: a swipe onto a full
   // floor, a purchase that cannot be made, and a tap on a guest who is not going anywhere.
@@ -1381,7 +1548,15 @@ function resetAudio() {
 // All player-facing text and content tables. Kept apart from logic so a wording pass never
 // touches game code. Archetypes, deny stamps and shop entries join this file at steps 2, 6 and 8.
 
-// Souls (GDD 5.2). g = Gullibility (Aura output), s = Sanctity (Suspicion risk), both 0-5.
+// Souls (GDD 5.2). Each archetype is authored as a person and not as a pair of outputs: `g` is how
+// credulous it is and `s` is how holy, both 0-5. What those two facts DO is decided in
+// 12_economy.js, and since the flip they do the opposite of what they used to. Sanctity is the
+// earner - it is what Head Office's instruments read in the lounge - and the card's red row is
+// Skepticism, which is `STAT_MAX - g` and is what feeds Suspicion. Gullibility itself is therefore
+// never displayed; it survives here because a person is more legible as "credulous 5" than as
+// "skeptical 0", and because the weighted averages the whole balance model is quoted against were
+// measured on it.
+
 // `weight` is the relative chance of drawing this archetype; `fromDay` withholds one until the
 // session has taught the player what the stats mean. Invented job titles only - no real people.
 //
@@ -1412,7 +1587,11 @@ const ARCHETYPES = [
   { name: 'The Genuinely Good Person', g: 0, s: 5, weight: 2, fromDay: GOOD_PERSON_DAY, glow: true }
 ];
 
-const STAT_LABEL = { g: 'GULLIBILITY', s: 'SANCTITY' };
+// The two rows of the docket, in the order the blank prints their markers: green first, red second.
+// Keyed by what the row MEANS rather than by the field it is computed from, because `k` is derived
+// and there is no `soul.k` for the key to be mistaken for.
+const STAT_LABEL = { s: 'SANCTITY', k: 'SKEPTICISM' };
+
 
 // Swipe affordances, shown in the free field around the card. The numbers each action is worth
 // join these labels at step 3, once there are resources for them to be about.
@@ -1571,10 +1750,17 @@ const SPEAKER_NAME = 'YOUR ONBOARDING SPECIALIST';
 // would have been the one beat nobody was ever made to read.
 const TUTORIAL = {
   firstCard: { hold: true,  text: 'Swipe up. Up is heaven. Up is also revenue.' },
-  deskSwipe: { hold: true,  text: 'Swipe down. Operations is not heaven, but it pays by the second.' },
+  deskSwipe: { hold: true,  text: 'Swipe down. Operations pays by the second, and a trusting soul pays best.' },
   denySwipe: { hold: true,  text: 'Swipe left. Turning one away costs ◈. A full lounge costs more.' },
   expiry:    { hold: true,  text: 'Their subscription lapsed. Tap them - the service elevator is discreet.' },
   quota:     { hold: false, text: 'Meet the daily ✦ quota, or Head Office starts noticing you.' },
+  // The repair (GDD 6.5). It holds, like the three swipe beats and for the same reason: it is the
+  // only gesture in the game that is not a tap or a swipe, so nothing the player already knows
+  // would lead them to try it. Two sentences: what the wreck costs, then the gesture - in that
+  // order, because the player has just watched the wreck happen and wants to know what it means
+  // before being told what to do about it.
+  repair:    { hold: true, life: TUTORIAL_LIFE_LONG,
+    text: 'That suite is out of service and Head Office can see it. Hold it to put it back.' },
   riot:      { hold: false, text: 'That is what an unhandled expiry sounds like. Upstairs can hear it.' },
   // Wave C, and the only beat that teaches a rule the player cannot see happening (GDD 4.1): the
   // queue thinning out is the readout, and a thing that stops arriving is much harder to notice
@@ -1664,14 +1850,50 @@ const SHOP_ITEMS = [
     base: 110, mult: 1, limit: 1, page: 'extras', floor: 'heaven', gives: { buzz: 9, susp: 0.030 } },
   { id: 'veranda',  name: 'Panoramic Veranda',        effect: '+ARRIVALS',       cost: '+SUSPICION',
     base: 80,  mult: 1, limit: 1, page: 'extras', floor: 'heaven', gives: { buzz: 6, susp: 0.022 } },
-  // The two slow ones say GOODWILL rather than ARRIVALS, because that is the honest difference:
-  // they pay into Reputation, which is the same quantity a day later (GDD 4.1).
-  { id: 'wings',    name: 'Orchestra of Found Wings', effect: '+GOODWILL',       cost: '+SUSPICION',
-    base: 145, mult: 1, limit: 1, page: 'extras', floor: 'heaven', gives: { buzz: 2, rep: 5, susp: 0.030 } },
+  // This one used to say GOODWILL and pay into Reputation, and it was the fourth item on a page of
+  // six that ended in the same number as the first three: Reputation's only consumer is
+  // buzzTarget(), so GOODWILL was ARRIVALS bought in instalments, sold next to ARRIVALS bought
+  // outright and cheaper. It now pays a guest whose contract has lapsed - half rate, for as long
+  // as the player leaves them standing there.
+  //
+  // It was a delay on the riot first, and that was measured and thrown away rather than tuned.
+  // RIOT_DELAY x1.5 moved the riot count of the style built to eat riots by 5%, because the state
+  // that causes a riot is a saturated basement and a saturated basement does not resolve inside
+  // eight extra seconds: at six desks a discharge lands every fourteen, and every one of them is
+  // already spoken for by an expiry further up the queue. A lever aimed at a condition that is not
+  // changing buys nothing, whatever number is on it.
+  //
+  // What is left standing in the suite meanwhile is the game's only genuinely dead object: an
+  // expired guest earns nothing, costs SUSP_PER_EXPIRED, and is waiting for a floor that is full.
+  // The orchestra plays to them, and the instruments upstairs keep reading. Nothing about the
+  // punishment is defused - the drip runs, the riot still comes, the suite is still wrecked - so
+  // this softens the dead time rather than the consequence, and it asks a question a moment later:
+  // a lapsed saint at half rate can out-earn the desk it would be filed into, and holding it there
+  // is a bet against the meter. Worth nothing at all to a player with no expiry standing, which is
+  // the off-state.
+  //
+  // It is charged in NOISE, and it is the only lounge attraction that is. The rule below - upstairs
+  // pays raw Suspicion, downstairs pays Noise - was written about the pool, and written about the
+  // right thing: a pool is not a sound, it is a large obviously fake object visible from outside,
+  // and no amount of lavender hides it. An orchestra is the exception that rule was drawn around.
+  // It matters mechanically as well as in the fiction: Suspicion from an attraction cannot be
+  // reduced by anything in the game, so a lounge attraction is a permanent unmitigable outgoing,
+  // and measured against a style that was already dying of audits it lost four runs in 24 whatever
+  // its benefit was. Charged as Noise it is dampenable - three Lavenders take 90% of it - so it
+  // becomes a purchase a dampener build can afford and a bad idea for anybody else, which is a
+  // decision rather than a tax.
+  { id: 'wings',    name: 'Orchestra of Found Wings', effect: 'LAPSED PAY',      cost: '+NOISE',
+    base: 110, mult: 1, limit: 1, page: 'extras', floor: 'heaven', gives: { lapsed: 0.5, noise: 0.030 } },
   { id: 'coffee',   name: 'Coffee Machine',           effect: '+15% Credits',    cost: '+NOISE',
     base: 95,  mult: 1, limit: 1, page: 'extras', floor: 'ops', gives: { credits: 0.15, noise: 0.030 } },
-  { id: 'wall',     name: 'Motivational Wall',        effect: '+GOODWILL',       cost: '+NOISE',
-    base: 75,  mult: 1, limit: 1, page: 'extras', floor: 'ops', gives: { rep: 2, noise: 0.024 } },
+  // The other half of the same fix, and it buys the other thing nothing touches: the card. Every
+  // one of the twenty-one purchasable things in this game is about the tower, and none of them is
+  // about the action the player performs two hundred times a run. This one widens the window on
+  // the Snap Decision (GDD 5.5), so a player who reads the docket rather than reflexing at it
+  // still earns the permanent 10%. It is worth nothing to a player who already snaps everything -
+  // it does not raise the bonus, it lowers the bar to it.
+  { id: 'wall',     name: 'Motivational Wall',        effect: 'LONGER SNAP',     cost: '+NOISE',
+    base: 75,  mult: 1, limit: 1, page: 'extras', floor: 'ops', gives: { snap: 0.5, noise: 0.024 } },
   { id: 'breakroom', name: 'Break Room',              effect: 'FASTER DESKS',    cost: '+NOISE',
     base: 120, mult: 1, limit: 1, page: 'extras', floor: 'ops', gives: { desk: 0.10, noise: 0.028 } },
 
@@ -1822,7 +2044,8 @@ const state = {
   buzz: 0,
   reputation: 0,
 
-  heavenSlots: [],      // { unlocked, guest }
+  heavenSlots: [],      // { unlocked, guest, maint, wrecked }
+
   cubicles: [],         // { unlocked, guest }
 
   queue: [],            // souls waiting; the one being decided sits on the card, not in here
@@ -1874,12 +2097,17 @@ const state = {
   // `denied`, `toOps` and `suspPeak` exist for the verdict on the ending screen (GDD 11) and for
   // nothing else: the title is read off how the run was played, so the run has to have been counted.
   stats: { soulsProcessed: 0, auraTotal: 0, creditsTotal: 0, daysSurvived: 0, riots: 0, processed: 0,
-           denied: 0, toOps: 0, suspPeak: 0, turnedAway: 0, completed: 0 }
+           denied: 0, toOps: 0, suspPeak: 0, turnedAway: 0, completed: 0, repaired: 0 }
 };
 
 function makeSlots(total, unlocked) {
   const arr = [];
-  for (let i = 0; i < total; i++) arr.push({ unlocked: i < unlocked, guest: null });
+  // `wrecked` is separate from `maint` and not a second name for it. Maintenance is the Renovation
+  // pact, it is chosen, it lasts one day and 13_fsm clears it every morning. A wreck is a riot's
+  // leavings: nobody chose it and nothing clears it but a thumb, which is the whole of why the
+  // riot now has a tail.
+  for (let i = 0; i < total; i++) arr.push({ unlocked: i < unlocked, guest: null, maint: false, wrecked: false });
+
   return arr;
 }
 
@@ -1958,7 +2186,7 @@ function resetGame() {
   resetAudio();
 
   state.stats = { soulsProcessed: 0, auraTotal: 0, creditsTotal: 0, daysSurvived: 0, riots: 0, processed: 0,
-                  denied: 0, toOps: 0, suspPeak: 0, turnedAway: 0, completed: 0 };
+                  denied: 0, toOps: 0, suspPeak: 0, turnedAway: 0, completed: 0, repaired: 0 };
 }
 
 // The deck is shuffled on the first night rather than in resetGame, and that is not tidiness: the
@@ -2005,15 +2233,22 @@ function dayConfig(day) {
 
 // Weighted draw over the archetype dictionary. Two rules bend the weights: the rarest archetype
 // is withheld until the player has learned to read the stats, and from the late days onward the
-// dangerous souls (Sanctity 4+) get twice their weight, which is what makes the late days feel
-// different without adding a single new mechanic.
+// dangerous souls get twice their weight, which is what makes the late days feel different without
+// adding a single new mechanic.
+//
+// Dangerous means high SKEPTICISM, and this line had to move with the flip or it would have been
+// doing the opposite of its job. It used to double the saints, which under the old axes were the
+// expensive souls; now the saints are the earners, and doubling them would have made the late days
+// richer instead of harder.
 function pickArchetype(day) {
   const pool = [];
   for (const a of ARCHETYPES) if (!a.fromDay || day >= a.fromDay) pool.push(a);
   return pickWeighted(pool, function (a) {
-    return (day >= LATE_DAY && a.s >= 4) ? a.weight * 2 : a.weight;
+    const late = day >= LATE_DAY && (STAT_MAX - a.g) >= LATE_SKEPTIC;
+    return late ? a.weight * 2 : a.weight;
   });
 }
+
 
 // A soul is a flat copy of its archetype, never a reference: from step 3 a soul carries per-soul
 // modifiers (the snap bonus) and must not write them back into the dictionary.
@@ -2093,12 +2328,14 @@ function dragDirection() {
 
 // --- Placement ----------------------------------------------------------------
 
-// A slot shut for maintenance (the Renovation contract, GDD 8.3) is unlocked and still owned, it
-// just cannot be filled today. Checked here and in freeSlotCount, which between them are every
-// place in the game that asks whether there is room.
+// A slot shut for maintenance (the Renovation contract, GDD 8.3) or wrecked by a riot (GDD 6.5) is
+// unlocked and still owned, it just cannot be filled. Checked here and in freeSlotCount, which
+// between them are every place in the game that asks whether there is room.
+
 function firstFreeSlot(slots) {
   for (let i = 0; i < slots.length; i++) {
-    if (slots[i].unlocked && !slots[i].maint && !slots[i].guest) return i;
+    if (slots[i].unlocked && !slots[i].maint && !slots[i].wrecked && !slots[i].guest) return i;
+
   }
   return -1;
 }
@@ -2137,6 +2374,7 @@ function newGuest(soul) {
     desk: deskTime(),         // only counts down while this guest is at a desk downstairs
     deskMax: deskTime(),      // and the bar above the desk is read against the length it started with
     expired: false,
+
     riot: 0,
     lift: 0,
     panic: 0,
@@ -2153,7 +2391,7 @@ function placeGuest(slots, index, soul) {
 // is when the player is still reading the card, and charging for that would teach the wrong thing.
 // Deny is neutral to it - there is nothing to be faster about when refusing.
 function claimSnapBonus(soul) {
-  if (state.day < SNAP_FROM_DAY || state.card.age > SNAP_TIME) return;
+  if (state.day < SNAP_FROM_DAY || state.card.age > snapTime()) return;
   soul.bonus = SNAP_BONUS;
   state.snapFlash = SNAP_FLASH;
   sfx('snap');
@@ -2210,16 +2448,32 @@ function reassign() {
 
 // Deny is the one action that is never refused - it is the pressure valve when both floors are
 // full. It costs Credits, so the valve has a price and spamming it is not a strategy.
+// Whether this refusal had an alternative. The LOUNGE only, and the exclusion of the basement is
+// the whole of what makes this price fair. A free desk is very often a deliberate buffer - a place
+// to put the next expiry before it becomes a riot - and a competent player keeps one or two empty
+// on purpose. Charging them for that would be charging them for planning: measured on 2 September,
+// counting desks took the balanced style from 7 wins in 24 to 1, because its two-desk buffer read
+// as room on every refusal it ever made. An empty SUITE is not ambiguous. It is the thing the soul
+// was refused from, it earns nothing standing empty, and there is no strategy that wants one.
+function denyHadRoom() {
+  return firstFreeSlot(state.heavenSlots) >= 0;
+}
+
+
 function deny() {
   const from = cardRect();
   addFlyer({ x: -CARD.w, y: from.y + 10, w: CARD.w, h: CARD.h }, C.suspicion);
-  spendCredits(DENY_COST);
+  const cost = denyHadRoom() ? DENY_COST_ROOM : DENY_COST;
+  spendCredits(cost);
   // Turning one away at the door is the cheapest action in the game and now has a second price:
   // word gets back, and tomorrow's queue is shorter for it (GDD 4.1).
   addReputation(-REP_DENY);
   // At the top of the work zone, not just above the card: everything in the band right above the
   // card is already spoken for by the swipe hints, and a cost printed across one of them is noise.
-  addPopup(VIEW_W / 2, Display.zones.work.y + 12, '-' + DENY_COST + ' ◈', C.suspicion);
+  // The number is printed rather than a fixed string precisely because there are two of them, and
+  // which one was charged is the whole of what the player has to learn from this popup.
+  addPopup(VIEW_W / 2, Display.zones.work.y + 12, '-' + cost + ' ◈', C.suspicion);
+
   state.stats.soulsProcessed++;
   state.stats.denied++;
   state.card = null;
@@ -2318,7 +2572,8 @@ function updateSouls(dt) {
 
 function freeSlotCount(slots) {
   let n = 0;
-  for (const s of slots) if (s.unlocked && !s.maint && !s.guest) n++;
+  for (const s of slots) if (s.unlocked && !s.maint && !s.wrecked && !s.guest) n++;
+
   return n;
 }
 
@@ -2330,10 +2585,13 @@ function contractState(guest) {
   return 'active';
 }
 
-// An expired guest produces nothing. That is the real cost of ignoring one - the Suspicion drip
-// for leaving it up there joins at step 5.
-function guestProduces(guest) {
-  return !guest.expired;
+// What fraction of its rate a guest in a suite is producing. An expired contract pays nothing -
+// that is the real cost of ignoring one, on top of the Suspicion drip for leaving it up there -
+// unless the Orchestra is playing, which is the one thing in the game that pays a lapsed guest
+// (GDD 9.2). It is a fraction rather than a flag because that is what the attraction sells: half
+// of nothing is still nothing, and the multiplication says so without a branch.
+function guestOutput(guest) {
+  return guest.expired ? attractionSum('lapsed') : 1;
 }
 
 function panicFactor(guest) {
@@ -2382,8 +2640,16 @@ function dischargeGuest(index) {
 
 // A guest whose contract ran out with no desk free downstairs eventually walks off in disgust.
 // The neighbours see it happen and slow down - the loss is never just the one slot.
+//
+// And it leaves the suite behind it. Before this the riot was a spike: five points of the meter,
+// the neighbours slowed for five seconds, and by the eighth second it had never happened. A guest
+// who tears the place up on the way out is the one event in the game the player caused by their own
+// arithmetic, and the only one whose consequence used to be shorter than the mistake that made it.
+// The wreck is what gives it a tail, and the tail is exactly as long as the player leaves it.
 function riot(index) {
   state.heavenSlots[index].guest = null;
+  state.heavenSlots[index].wrecked = true;
+
   for (const j of [index - 1, index + 1]) {
     const n = state.heavenSlots[j];
     if (n && n.guest) n.guest.panic = PANIC_TIME;
@@ -2397,7 +2663,8 @@ function riot(index) {
   // Over the slot that just emptied, not at the top of the zone: that band belongs to the waiting
   // queue, and it marks which slot the player just lost.
   const r = heavenSlotRect(index);
-  addPopup(r.x + r.w / 2, r.y - 8, 'WALKED OUT', C.suspicion, POPUP_LIFE_LONG);
+  addPopup(r.x + r.w / 2, r.y - 8, 'WRECKED', C.suspicion, POPUP_LIFE_LONG);
+
   sfx('riot');
   // Fired from here rather than from a condition: by the time a riot is visible in the state, the
   // guest that caused it has already gone (GDD 8.4).
@@ -2509,9 +2776,19 @@ function slotSide(kind, i) {
   return 0;
 }
 
-// What is out past one edge of one floor, in priority order: an expired contract first, then a
-// free slot with something waiting to fill it. Returns null when that edge has nothing to say.
-// `index` is the nearest such slot, which is where a tap on the chevron scrolls to.
+// What is out past one edge of one floor, in priority order: work first, then a free slot with
+// something waiting to fill it. Returns null when that edge has nothing to say. `index` is the
+// nearest such slot, which is where a tap on the chevron scrolls to.
+//
+// A wreck counts as work, alongside an expired contract, and shares the red chevron rather than
+// getting a third kind. That is not crowding two meanings into one channel - it is the channel's
+// actual meaning, which was always "there is something off-screen that wants your thumb". One of
+// them wants a tap and the other a hold; both want you to scroll there, which is all the chevron
+// does. GDD 9.4 rejects a fourth attention channel, and a wreck does not need one.
+//
+// It also has to be excluded from the free count below, or the white chevron would point at a slot
+// nothing can be put into - an arrow that lies is worse than no arrow.
+
 function edgeReport(kind, side) {
   const slots = stripSlots(kind);
   const count = visibleSlotCount(slots);
@@ -2531,7 +2808,11 @@ function edgeReport(kind, side) {
         alerts++;
         if (alertIndex < 0) alertIndex = i;
       }
-    } else if (freeIndex < 0) freeIndex = i;
+    } else if (slot.wrecked) {
+      alerts++;
+      if (alertIndex < 0) alertIndex = i;
+    } else if (!slot.maint && freeIndex < 0) freeIndex = i;
+
   }
   if (alerts > 0) return { alert: true, count: alerts, index: alertIndex };
   if (wants && freeIndex >= 0) return { alert: false, count: 0, index: freeIndex };
@@ -2593,16 +2874,126 @@ function handleFloorTap(g) {
   handleChevronTap(g, false);
 }
 
+// --- Repairing a wrecked suite (GDD 6.5) --------------------------------------
+
+// A press-and-hold on a suite a riot tore up. It costs nothing but the seconds the thumb spends on
+// it, which is the scarcest thing the player has: the queue keeps arriving through the hold and the
+// card on the desk keeps ageing out of its snap bonus.
+//
+// This gesture replaced the concierge, and the reason is worth keeping. The concierge held an
+// OCCUPIED suite and made its guest present better, which was available on every guest, all the
+// time, forever, at a price nobody could feel - `served` ran at about 40 of some 45 check-ins per
+// run, so it was not a decision, it was a tax the player paid themselves for existing. A repair
+// cannot become that, because the game only ever offers it as the consequence of a riot: the
+// mechanic is unavailable to a player who is keeping up, and it is unavoidable for one who is not.
+//
+// The gesture still fits the one hole the input vocabulary had - a tap on an occupied suite has
+// always been a shrug, and a tap on an expired guest is the lift - and it now sits on the one
+// object in the lounge that had no gesture at all.
+const serviceHold = { slot: -1, t: 0, fired: false, consume: false, was: false };
+
+// A wreck, and nothing else. It is re-checked when the hold completes for the same reason the
+// concierge re-checked its guest: what is under a resting finger can change under it.
+function servableSlot(i) {
+  const slot = state.heavenSlots[i];
+  return !!slot && slot.unlocked && slot.wrecked;
+}
+
+function serviceReady() {
+  return state.screen === SCREEN.DAY_ACTIVE && !state.dayHold && !tutorialHolding();
+}
+
+
+// Which suite a finger came down on, or -1. Resolved once, at the moment the finger lands: the
+// strip cannot scroll under a hold (it needs SCROLL_AXIS_LOCK px of travel, and travel cancels the
+// hold), so the slot found here is the slot still under the thumb when the hold completes.
+function serviceSlotAt(x, y) {
+  if (!serviceReady()) return -1;
+  const count = visibleSlotCount(state.heavenSlots);
+  for (let i = 0; i < count; i++) {
+    if (!servableSlot(i)) continue;
+    if (pointInRect(x, y, heavenSlotRect(i))) return i;
+  }
+  return -1;
+}
+
+function serveGuest(i) {
+  state.heavenSlots[i].wrecked = false;
+  state.stats.repaired++;
+  spendCredits(REPAIR_COST);
+  const r = heavenSlotRect(i);
+  addPopup(r.x + r.w / 2, r.y - 4, '-' + REPAIR_COST + ' ◈', C.suspicion, POPUP_LIFE_LONG);
+
+  addShake(2, 0.12);
+  haptic(HAPTIC.checkIn);
+  sfx('serve');
+}
+
+
+// Live, like the strip drag and for the same reason: the ring has to fill under the finger, so this
+// reads Input.drag every frame instead of waiting for a gesture on release.
+//
+// Movement cancels rather than merely pausing. TAP_SLOP (7) is one pixel past SCROLL_AXIS_LOCK (6),
+// so by the time a finger has moved far enough to abandon the hold the strip has already committed
+// to its axis: a scroll that starts on a guest scrolls, and never also serves.
+function updateServiceHold(dt) {
+  const d = Input.drag;
+  if (!d.active) { serviceHold.was = false; serviceHold.slot = -1; serviceHold.t = 0; return; }
+
+  if (!serviceHold.was) {
+    serviceHold.was = true;
+    serviceHold.fired = false;
+    serviceHold.consume = false;
+    serviceHold.t = 0;
+    serviceHold.slot = serviceSlotAt(d.startX, d.startY);
+  }
+  if (serviceHold.slot < 0 || serviceHold.fired) return;
+
+  if (Math.max(Math.abs(d.dx), Math.abs(d.dy)) > TAP_SLOP) { serviceHold.slot = -1; serviceHold.t = 0; return; }
+
+  serviceHold.t += dt;
+  if (serviceHold.t < SERVICE_HOLD) return;
+  // Re-checked rather than trusted, on the same principle the concierge used: what was under the
+  // finger when it came down is not necessarily what is under it 1.2 seconds later.
+  if (servableSlot(serviceHold.slot)) serveGuest(serviceHold.slot);
+
+  serviceHold.fired = true;
+  // The release of a completed hold still arrives as a tap - it never moved - and that tap would
+  // reach the slot underneath. It is eaten once, by the one gesture it belongs to, rather than by
+  // a flag left standing between gestures.
+
+  serviceHold.consume = true;
+  serviceHold.slot = -1;
+}
+
+// How full the ring under the finger is, 0 when there is no hold in progress. Read by the renderer.
+function serviceHoldOn(i) {
+  return (serviceHold.slot === i && serviceHold.t > 0) ? clamp(serviceHold.t / SERVICE_HOLD, 0, 1) : 0;
+}
+
 // --- Input --------------------------------------------------------------------
 
 // A tap on an expired guest sends it downstairs. A tap on a working one gets a shrug: there is no
 // early eviction in this game, and planning the buffer downstairs ahead of time is the strategy.
 function handleSlotTap(g) {
+  if (serviceHold.consume) { serviceHold.consume = false; return true; }
+
   const count = visibleSlotCount(state.heavenSlots);
   for (let i = 0; i < count; i++) {
     const slot = state.heavenSlots[i];
+    // A tap on a wreck answers instead of falling through to nothing. This is the whole of the
+    // gesture's discoverability: the player who has just watched a guest tear a suite up will tap
+    // it, and a tap that does nothing at all teaches that the suite is scenery. A shake and the
+    // same refusal note the game already uses says "not like that" - and the hold ring that starts
+    // filling the moment the finger stays says the rest without a word.
+    if (!slot.guest && slot.wrecked && pointInRect(g.x, g.y, heavenSlotRect(i))) {
+      addShake(2, 0.12);
+      sfx('busy');
+      return true;
+    }
     if (!slot.guest) continue;
     if (!pointInRect(g.x, g.y, heavenSlotRect(i))) continue;
+
 
     // An armed Contract Termination (GDD 9.1) outranks both of the answers below: the player has
     // already paid for this tap and is being asked which suite, so a working contract must not
@@ -2625,6 +3016,8 @@ function handleSlotTap(g) {
 // --- Update -------------------------------------------------------------------
 
 function updateFloors(dt) {
+  updateServiceHold(dt);
+
   for (let i = 0; i < state.heavenSlots.length; i++) {
     const guest = state.heavenSlots[i].guest;
     if (!guest) continue;
@@ -2679,17 +3072,43 @@ function updateFloors(dt) {
 
 // Aura and Credits production, Suspicion sources and Noise, the daily quota and shop purchases
 // (GDD 4, 7, 9). Build steps 3, 5, 6 and 8. Step 3 is the two production lines and nothing else:
-// a soul upstairs makes Aura out of how easily it is fooled, a soul downstairs makes Credits.
+// a soul upstairs makes Aura out of how holy it is, a soul downstairs makes Credits.
+
+// Skepticism is the complement of Gullibility and is derived here rather than stored, because a
+// soul has one temperament and storing both halves of it is storing the same fact twice. The
+// archetype dictionary authors the person - how credulous, how holy - and this file decides what
+// that person is worth and what it costs.
+function soulSkepticism(soul) {
+  return STAT_MAX - soul.g;
+}
 
 // One soul cannot make both, which is the whole tension of the game: Aura pays today's quota,
 // Credits buy tomorrow's capacity. The snap bonus is per soul and permanent, so it travels with
 // the soul if it is later moved downstairs.
+//
+// Sanctity is the whole of it. There was a concierge floor here until 2 September, and its removal
+// is the point rather than a simplification: what a guest is worth upstairs is now a fact about the
+// guest, so the only way to raise production is to house better souls or house more of them.
 function soulAura(soul) {
-  return soul.g * AURA_PER_G * (soul.bonus || 1) * auraMult();
+  return soul.s * AURA_PER_S * (soul.bonus || 1) * auraMult();
 }
 
+
+
+
+// And what it is worth downstairs is a fact about the guest too, since 2 September. Gullibility is
+// the seller's stat: a credulous soul at a desk signs whatever Operations puts in front of it, a
+// doubter does the filing and nothing else. This is the other half of what the flip left undone -
+// Sanctity was given the lounge, and the basement was left paying a flat rate to everybody, so
+// half the card had no question in it.
+//
+// The two floors read the two stats and neither reads both, which is what keeps them a choice:
+// Sanctity earns upstairs and is charged nothing there, Gullibility earns downstairs and is charged
+// nothing there, and the cost of a suite is the Skepticism that comes with the holy. A soul is
+// therefore rarely equally good in both places, and never bad in both by accident - the base rate
+// sees to that.
 function soulCredits(soul) {
-  return CREDITS_PER_CUBICLE * (soul.bonus || 1) * creditMult();
+  return (CREDITS_BASE + CREDITS_PER_G * soul.g) * (soul.bonus || 1) * creditMult();
 }
 
 // The four upgrades that are not an unlock are read here, at the point they apply, rather than
@@ -2707,6 +3126,11 @@ function creditMult() {
 // someone's stay would silently rewind the ring the player is reading.
 function contractTime() {
   return CONTRACT_TIME * (1 + UP_CONTRACT * upgradeLevel('eula')) * state.pact.contractMult;
+}
+
+// How long a card may sit on the desk and still be worth the Snap Decision bonus (GDD 5.5).
+function snapTime() {
+  return SNAP_TIME * (1 + attractionSum('snap'));
 }
 
 // How long a soul sits at a desk. Kept on the guest as `deskMax` when it arrives there, for the
@@ -2749,7 +3173,8 @@ function addPopup(x, y, text, color, life) {
 }
 
 // A banked total that rounds to nothing produces no popup at all. That is deliberate feedback:
-// a soul with no Gullibility is visibly earning the resort nothing.
+// a soul with no Sanctity is visibly earning the resort nothing.
+
 function flushProduction(guest, rect, symbol, color) {
   const whole = Math.round(guest.acc);
   if (whole > 0) addPopup(rect.x + rect.w / 2, rect.y - 4, '+' + whole + ' ' + symbol, color);
@@ -2760,8 +3185,12 @@ function flushProduction(guest, rect, symbol, color) {
 function updateEconomy(dt) {
   for (let i = 0; i < state.heavenSlots.length; i++) {
     const guest = state.heavenSlots[i].guest;
-    if (!guest || !guestProduces(guest)) continue;
-    const rate = soulAura(guest.soul) * panicFactor(guest);
+    if (!guest) continue;
+    const rate = soulAura(guest.soul) * panicFactor(guest) * guestOutput(guest);
+    if (rate <= 0) continue;
+
+
+
     state.aura += rate * dt;
     state.stats.auraTotal += rate * dt;
     if (bankProduction(guest, rate, dt)) {
@@ -3125,12 +3554,15 @@ function addSuspicion(amount) {
   checkAudit();
 }
 
-// Sanctity is a threshold, not a slope: one pip is free and everything above it costs. A linear
-// cost per point cannot both leave an ordinary soul cheap and make a saint frightening, and the
-// stat is only worth reading on the card if the answer changes somewhere along the row of pips.
-function sanctityRate(soul) {
-  return Math.max(0, soul.s - SUSP_SANCTITY_FREE) * SUSP_PER_SANCTITY;
+// Skepticism is a threshold, not a slope: the first two pips are free and everything above them
+// costs. A linear cost per point cannot both leave an ordinary soul cheap and make a hard case
+// frightening, and the stat is only worth reading on the card if the answer changes somewhere
+// along the row of pips.
+function skepticRate(soul) {
+  return Math.max(0, soulSkepticism(soul) - SUSP_SKEPTIC_FREE) * SUSP_PER_SKEPTIC;
 }
+
+
 
 // Every soul at a desk downstairs is audible upstairs. This is the whole reason the basement is a
 // decision rather than free money, and the reason the dampener in the shop is worth buying.
@@ -3159,13 +3591,19 @@ function suspicionRate() {
   // away still costs full price, because a one-off hit is an event and the choir is not loud enough
   // to make an event not have happened.
   for (const slot of state.heavenSlots) {
+    // A suite nobody has put back is charged whether or not anything is standing in it (GDD 6.5).
+    // It is charged in this loop rather than with the tower sources above because it is a fact
+    // about one slot rather than about the building - and because it has to end the instant a
+    // thumb has spent SERVICE_HOLD on it, which is a per-slot event.
+    if (slot.wrecked) rate += SUSP_PER_WRECK;
     const guest = slot.guest;
     if (!guest) continue;
-    // A saint is a risk whether or not the contract still runs, and an expired guest is a second
+    // A doubter is a risk whether or not the contract still runs, and an expired guest is a second
     // risk on top: it is standing in the lounge asking the window questions.
-    rate += sanctityRate(guest.soul);
+    rate += skepticRate(guest.soul);
     if (guest.expired) rate += SUSP_PER_EXPIRED;
   }
+
   // The Experience Manager charges by the head, and the Renegade Auditor scrubs a flat rate off
   // whatever the tower is producing. The auditor can take the total below zero, which is the one
   // exception to "the meter never falls on its own" - it is not falling on its own, it is being
@@ -3513,9 +3951,10 @@ function startDay(day) {
   // Both floors open at their left end. Souls fill the leftmost free slot, so that is where the
   // day starts from however far the player had scrolled when the last one ended.
   resetStrips();
-  // What the attractions were bought for, collected once a morning (GDD 9.2): the wall and the
-  // orchestra are a slow, compounding lever on the intake rather than a number in the HUD.
-  addReputation(attractionSum('rep'));
+  // The morning Reputation payment was removed on 2 September with the two attractions that made
+  // it: nothing in the shop gives Reputation any more, so the call had nothing left to add. The
+  // meter moves on events alone now - a contract carried to term, a riot, a refusal, a guest
+  // turned away at the door - which is what it always meant.
   applyPactToDay();
   // A beat that was still on screen when the clock ran out does not survive the night: it is drawn
   // only during a day, so it would otherwise sit frozen in state and reappear half faded on the
@@ -7654,6 +8093,59 @@ function deskBar(ctx, x, y, w, h, fraction) {
   fillRect(ctx, x, y, Math.round(w * fraction), h, C.monitorLit);
 }
 
+// The repair hold filling under the finger (GDD 6.5). A PERIMETER rather than a bar, and for the
+
+// reason the desk bar comment works out the hard way: a straight line of some length is not a
+// fraction of anything unless something says how long it would have been. A closed shape says it
+// for free - the eye knows where the rest of the rectangle is - which is the same property the
+// halo relies on, and it costs no track and no second colour.
+//
+// It starts at the bottom left corner and runs clockwise, so the first thing that moves is the
+// floor of the suite, under the guest, where the finger already is.
+// The other half of the same readout: the suite visibly coming back. A band of the clean cloud
+// light rising off the floor of the niche, level with how much of the hold has been paid, and a
+// solid line at its surface so the edge that moves is the brightest thing in the drawing.
+//
+// It exists because the ring alone starts too slowly to answer the only question a resting finger
+// asks. The ring's first run is along the floor, one pixel at a time from the left corner, so a
+// tenth of a second in there are four pixels of it in a corner of a 40x48 niche, and the honest
+// reading of that screen is that nothing is happening. The band is 40 pixels wide from the first
+// frame and it only has to move a row to be seen moving.
+function drawHoldFill(ctx, x, y, w, h, fraction) {
+  x = Math.round(x); y = Math.round(y); w = Math.round(w); h = Math.round(h);
+  // Inset by the one pixel the outline and the ring stand on, so the band fills the room rather
+  // than the frame around it.
+  const inner = h - 2;
+  const level = Math.round(inner * clamp(fraction, 0, 1));
+  if (level <= 0) return;
+  const top = y + 1 + inner - level;
+  ctx.globalAlpha = HOLD_FILL_ALPHA;
+  fillRect(ctx, x + 1, top, w - 2, level, C.aura);
+  ctx.globalAlpha = 1;
+  fillRect(ctx, x + 1, top, w - 2, 1, C.aura);
+}
+
+function drawHoldRing(ctx, x, y, w, h, fraction) {
+  x = Math.round(x); y = Math.round(y); w = Math.round(w); h = Math.round(h);
+  const total = 2 * (w + h) - 4;
+  let left = Math.round(total * clamp(fraction, 0, 1));
+  ctx.fillStyle = C.aura;
+  // Four runs, in order: floor left-to-right, right wall up, ceiling right-to-left, left wall down.
+  const runs = [
+    [x, y + h - 1, 1, 0, w],
+    [x + w - 1, y + h - 2, 0, -1, h - 2],
+    [x + w - 1, y, -1, 0, w],
+    [x, y + 1, 0, 1, h - 2]
+  ];
+  for (const [sx, sy, dx, dy, len] of runs) {
+    const n = Math.min(left, len);
+    for (let i = 0; i < n; i++) ctx.fillRect(sx + dx * i, sy + dy * i, 1, 1);
+    left -= n;
+    if (left <= 0) return;
+  }
+}
+
+
 // The marker an expired contract puts inside its halo, and the reason it is drawn here rather than
 // set in the font.
 //
@@ -7963,9 +8455,33 @@ function renderScene(ctx) {
   for (let i = 0; i < hCount; i++) {
     const r = heavenSlotRect(i);
     const slot = state.heavenSlots[i];
+    // The hold readout brackets the state outlines rather than sitting on one side of them: the
+    // rising band goes under, because it is what is happening inside the room, and the ring goes
+    // over, because it is drawn on the same four rows as the outline it is filling.
+    //
+    // The order used to be ring-first, and that is how a working progress readout came to be
+    // invisible. The ring is the slot rectangle and a wreck's outline is the same slot rectangle,
+    // so the red line below repainted every pixel of it every frame - and a wreck is the ONLY
+    // thing the hold is ever offered on, so the ring was covered on every hold there has ever
+    // been. Drawn afterwards it converts that outline from red to clean as it goes round, which is
+    // the sentence the gesture was always trying to say.
+    //
+    // A wreck was briefly drawn with a bar along the floor of the niche as well as the outline
+    // below. The screenshot settled it: the bar lands under the outline's own bottom edge, so it
+    // was a second piece of vocabulary saying what the first already said.
+    const hold = serviceHoldOn(i);
+
+    if (hold > 0) drawHoldFill(ctx, r.x, r.y, r.w, r.h, hold);
     if (!slot.unlocked) {
       drawLock(ctx, r.x + (r.w - 12) / 2, r.y + (r.h - 12) / 2);
+    } else if (slot.wrecked) {
+      // Outlined solid rather than dashed, and in the same red as the mark on its floor. Dashed is
+      // spoken for twice over in this row - cyan for "a swipe could land here", ink for "empty with
+      // souls waiting" - and both of those mean a slot that is available. This one is the opposite,
+      // so it does not borrow their line style.
+      strokeRect(ctx, r.x, r.y, r.w, r.h, C.suspicion);
     } else if (slot.guest && armedTermination()) {
+
       // An armed Contract Termination (GDD 9.1) turns the question round: for as long as it is
       // waiting, the OCCUPIED suites are the targets, so they are the ones outlined.
       strokeRect(ctx, r.x, r.y, r.w, r.h, C.suspicion);
@@ -7978,6 +8494,11 @@ function renderScene(ctx) {
       if (dir === 'up') dashedRect(ctx, r.x, r.y, r.w, r.h, C.aura, 3, 3, 0);
       else if (idle) dashedRect(ctx, r.x, r.y, r.w, r.h, C.ink, 3, 3, 0);
     }
+    // Last, over whichever outline the branch above drew. It cannot collide with the swipe-target
+    // outline - the input layer is single-touch everywhere, so a card being dragged and a suite
+    // being held cannot coexist - and a wrecked suite is never a swipe target anyway, because it
+    // is not a slot anything can be put in.
+    if (hold > 0) drawHoldRing(ctx, r.x, r.y, r.w, r.h, hold);
   }
 
   const cCount = visibleSlotCount(state.cubicles);
@@ -9021,11 +9542,15 @@ function paintCard(g, soul) {
   drawText(g, soul.name, CARD_NAME.x, CARD_NAME.y, C.inkText, 1);
   drawSoulPortrait(g, soul);
 
+  // Green row first, red row second, because that is the order the blank prints its two markers in
+  // and the marker is what carries the good/bad reading before a word has been read.
+
   const pips = SPR_SOUL_CARD.pips;
-  drawText(g, STAT_LABEL.g, CARD_STAT_X, pips.rows[0], C.inkText, 1);
-  drawPips(g, pips.rows[0], soul.g, C.good);
-  drawText(g, STAT_LABEL.s, CARD_STAT_X, pips.rows[1], C.inkText, 1);
-  drawPips(g, pips.rows[1], soul.s, C.suspicion);
+  drawText(g, STAT_LABEL.s, CARD_STAT_X, pips.rows[0], C.inkText, 1);
+  drawPips(g, pips.rows[0], soul.s, C.good);
+  drawText(g, STAT_LABEL.k, CARD_STAT_X, pips.rows[1], C.inkText, 1);
+  drawPips(g, pips.rows[1], soulSkepticism(soul), C.suspicion);
+
 
   // What this particular soul is worth, in each direction, before the player has to decide. The
   // arrows are the same ones the swipe hints use, so the line reads as two options and not as two
@@ -9037,7 +9562,8 @@ function paintCard(g, soul) {
   // each ramp only reaches 2.4:1. So the number - the part that has to be read - is printed in the
   // form's own ink at 9.5:1, and the colour is spent on the arrow and the unit mark, which are
   // shapes the player already knows from the HUD and only have to be recognised.
-  const aura = soul.g > 0 ? C.auraDark : C.inkDim;
+  const aura = soul.s > 0 ? C.auraDark : C.inkDim;
+
   drawWorth(g, '+' + soulAura(soul).toFixed(1), '↑', '✦/s', CARD_WORTH.x, aura);
   const down = '+' + soulCredits(soul).toFixed(1);
   drawWorth(g, down, '↓', '◈/s', CARD_WORTH.right - worthWidth(down, '↓', '◈/s'), C.goldDark);
@@ -9169,7 +9695,12 @@ function renderActionLabel(ctx) {
   } else if (dir === 'down') {
     labelPlate(ctx, 'REASSIGN  +' + soulCredits(soul).toFixed(1) + ' ◈/s', cx, Display.zones.ops.y + 10, C.ink);
   } else {
-    labelPlate(ctx, 'DENY  -' + DENY_COST + ' ◈', cx, Display.zones.work.y + 10, C.suspicion);
+    // The price the swipe would actually charge, not the cheap one. The two prices are the whole
+    // of GDD 6's "refusing with room costs more", and a hint that always quoted the lower one
+    // would be teaching the opposite of the rule at the exact moment the player is deciding.
+    labelPlate(ctx, 'DENY  -' + (denyHadRoom() ? DENY_COST_ROOM : DENY_COST) + ' ◈', cx,
+               Display.zones.work.y + 10, C.suspicion);
+
   }
 }
 
@@ -9190,7 +9721,13 @@ function renderPopups(ctx) {
     const t = clamp(p.t, 0, 1);
     const y = Math.round(p.y - POPUP_RISE * easeOut(t));
     ctx.globalAlpha = t > 0.6 ? (1 - t) / 0.4 : 1;
-    drawTextOutlined(ctx, p.text, p.x, y, p.color, C.bgDeep);
+    // Kept inside the canvas. Every popup until now was three or four characters wide over a slot
+    // that is never within half of that of an edge, so centring on the slot was enough; a word over
+    // the leftmost suite is not, and half of it went off the screen. Clamped rather than moved to
+    // the middle of the row: which slot a popup belongs to is the whole of what it is saying.
+    const half = textWidth(p.text, 1) / 2;
+    const x = clamp(p.x, EDGE_MARGIN + half, VIEW_W - EDGE_MARGIN - half);
+    drawTextOutlined(ctx, p.text, x, y, p.color, C.bgDeep);
     ctx.globalAlpha = 1;
   }
 }
@@ -9335,6 +9872,19 @@ function tutorialCheck() {
     }
   }
   if (expiredGuestCount() > 0) tutorialSay('expiry');
+
+  // The repair (GDD 6.5), on the first wreck the player ever has. No day gate is needed and none is
+  // wanted: the beat cannot fire before there is a wreck, a wreck cannot happen before a riot, and
+  // a riot on day one is very nearly impossible with a 70 s contract inside a 55 s day. The game
+  // decides when to teach this, and it decides by the player having got something wrong - which is
+  // the same sentence as the mechanic itself.
+  // Asked after the expiry beat rather than before it: an expired contract is the emergency and has
+  // to keep the front of the queue, and a wreck is still there a few seconds later. It is, in fact,
+  // still there tomorrow, which is the point of it.
+  for (const slot of state.heavenSlots) {
+    if (slot.wrecked) { tutorialSay('repair'); break; }
+  }
+
 
   // The turn, and the last day (GDD 8, 8.4). Both are checked before the day-one beats below have
   // any chance of being true again, and both fire in the first frames of their day - the Associate
@@ -10634,8 +11184,10 @@ let lastTime = 0;
 let fpsFrames = 0, fpsTime = 0, fps = 0;
 
 function update(dt) {
+  updateInput(dt);
   for (const g of Input.gestures) handleGesture(g);
   Input.gestures.length = 0;
+
 
   updateGame(dt);
   updateFx(dt);
