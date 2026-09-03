@@ -10417,7 +10417,23 @@ const bus = [], busWet = [], pan = [[],[],[]], dry = [[],[],[]], wet = [[],[],[]
 let shaper = null;
 let noiseBuf = null;
 const SPREAD = .3;
-const LOW_LATENCY = .06;    // seconds of output buffer asked for on the low tier; see initAudio
+// How much output buffer to ask the device for, in SECONDS, because that is the only unit the API
+// takes: `latencyHint` accepts a word or a number of seconds and the browser rounds up to a power
+// of two itself. There is no way to name a frame count. 2048 frames is the target, and this one
+// number hits it on both rates the game will meet - 0.0427 x 48000 is 2048 exactly, and
+// 0.0427 x 44100 is 1882, which rounds up to the same 2048. A 96 kHz device gets 4096 frames,
+// which is the same 43 ms.
+//
+// Why 2048 and not more: a wider buffer does not reduce the work, it only gives the audio thread
+// longer to finish it. It buys out jitter - a main-thread stall, a garbage collection - and buys
+// nothing at all against a device that simply cannot render the mix in real time; that failure
+// just arrives later and larger. Past the point where jitter is covered, the only thing another
+// doubling buys is delay between a swipe and its stamp. 43 ms is roughly one frame of a 24 fps
+// film and sits under what a hand reads as lag; 4096 would be 85 ms, which does not.
+//
+// The same value on every device on purpose. A phone that sounds like the desktop is the goal, and
+// a tier branch here would mean the desktop can no longer be used to test what the phone will do.
+const OUT_LATENCY = 2048 / 48000;
 
 function distCurve(k){
   const n = 1024, c = new Float32Array(n);
@@ -10444,21 +10460,24 @@ function makeIR(sec, decay, damp, chans){
 function initAudio(){
   if (AC) return;
   const Ctor = window.AudioContext || window.webkitAudioContext;
-  // `latencyHint` is the whole difference between a phone that plays this and a phone that
-  // crackles. The default, 'interactive', asks for the smallest output buffer the device will
-  // give - on Android that can be 256 frames, about 5 ms, and any stall longer than that on the
-  // audio thread is an audible tear. We do not need 5 ms: the tightest thing in the game is a
-  // stamp sound answering a swipe, and 70 ms between finger and thunk is around what a hand
-  // starts to notice. So the low tier spends most of that on a buffer big enough to ride out a
-  // hitch. LOW_LATENCY is the dial: raise it if a device still crackles, lower it if the stamps
-  // feel detached from the swipe.
-  try { AC = new Ctor(quality ? { latencyHint: 'interactive' } : { latencyHint: LOW_LATENCY }); }
+  // The output buffer, and the single most effective thing in this file against crackling. Left
+  // to itself the API picks 'interactive', which asks for the SMALLEST buffer the device will
+  // give - on Android that can be 256 frames, about 5 ms, and any stall longer than 5 ms on the
+  // audio thread is an audible tear. Nothing in this game needs 5 ms. See OUT_LATENCY for what is
+  // asked for instead and why that number.
+  try { AC = new Ctor({ latencyHint: OUT_LATENCY }); }
   catch (e) { AC = new Ctor(); }         // Safari before 14 has no option bag
   buildWaves();
 
   // Every noise in the game - snares, hats, cymbals, the breath on top of a pad - reads from
   // this one buffer at a random offset. Four seconds covers the longest single call (the 2.6 s
   // fallback voice in `emit`) with room to move the read head. See `noiseAt`.
+  //
+  // The third buffer, and the only one that should NOT be made wider. It is written once and read
+  // for the rest of the run, so its size buys no headroom against anything - it is not absorbing
+  // jitter, it is a table. All another four seconds would buy is 768 kB of resident memory and
+  // read positions nobody can tell apart from the ones already there: even a 40 ms hat has most
+  // of four seconds of places to start.
   {
     const len = AC.sampleRate * 4 | 0;
     noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
@@ -10742,13 +10761,23 @@ function setReverb(on){
 // ---------------------------------------------------------------------------
 // 5. Scheduler (lookahead - the timing does not drift the way setTimeout does)
 // ---------------------------------------------------------------------------
-// The lookahead is how far ahead of the clock notes are handed to the audio thread, and so how
-// long the main thread is allowed to be busy before a note misses its slot and is dropped. A
-// desktop frame is 16 ms and 140 ms of slack is generous. A phone rendering this canvas is not
-// so even - a sprite decode or a collection can eat a fifth of a second - and every note that
-// lands late is a hole in the bar. The low tier buys the slack; the cost is that the mix reacts
-// to Suspicion a third of a second later, which nobody can hear against a 0.9 s crossfade.
-let AHEAD = .14;
+// The second buffer, and a completely different one from the output buffer: this is how far ahead
+// of the clock notes are handed over, and so how long the MAIN thread may be blocked before a note
+// misses its slot and `emit` throws it away. A dropped note is a hole in the bar, which sounds
+// like the same fault as a crackle and is not one.
+//
+// It costs nothing in the way the output buffer does. Sound effects are scheduled against
+// `currentTime` when they fire, not through this, so widening it does not put any delay between a
+// finger and a stamp. What it does delay is the mix ANSWERING - a Suspicion crossfade only reaches
+// notes emitted after it, so the mix reacts one lookahead late, against a fade that already takes
+// 0.9 s.
+//
+// So why not a full second. Nodes enter the `live` registry when they are scheduled, not when they
+// sound, so a wider lookahead means more of them registered at any moment - and CAP_SOFT/CAP_HARD
+// start dropping low-priority notes on that count. Past a point, widening this buffer thins the
+// arrangement, which is the exact thing it exists to prevent. 250 ms is roughly a 15 fps stall
+// survived intact and adds about a tenth to the registry against a typical note length.
+let AHEAD = .25;
 const TICK_MS = 25;
 // live counts NODES, not notes: one voice is 2 to 5 nodes
 let CAP_SOFT = 200, CAP_HARD = 300;
@@ -10760,7 +10789,7 @@ let liveCount = 0;
 // Applies everything the tier decides that is not frozen into the graph at init. `quality` itself
 // is read per note by `sub` and `voice`; these three are read by the scheduler.
 function applyTier(){
-  AHEAD    = quality ? .14 : .34;
+  AHEAD    = quality ? .25 : .34;
   CAP_SOFT = quality ? 200 : 110;
   CAP_HARD = quality ? 300 : 170;
 }
@@ -11289,6 +11318,13 @@ return {
       // Scheduler ticks that arrived more than 120 ms late, and the worst gap seen, since the
       // context was created. Both are diagnostics: nothing in the engine reads them.
       late: lateHits, worstGap: worstGap,
+      // What the device actually GAVE us, as opposed to what OUT_LATENCY asked for. `latencyHint`
+      // is a request and the answer is the device's; this is the only way to find out what it
+      // said. baseLatency is the graph's own buffering, outputLatency adds everything between the
+      // buffer and the speaker and is absent on Safari.
+      sampleRate: AC ? AC.sampleRate : 0,
+      baseLatency: AC ? (AC.baseLatency || 0) : 0,
+      outputLatency: AC ? (AC.outputLatency || 0) : 0,
       buses: AC ? bus.map(b => b.gain.value) : [1, 0, 0],
       levels: Array.from(chLevel),
     };
