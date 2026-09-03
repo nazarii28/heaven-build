@@ -8115,7 +8115,7 @@ function buildHaloBand() {
 // so what shows through a failing halo is the sky behind it. An earlier cut painted the gaps in a
 // dark tone, which is a pitted ring rather than a broken one; a hole you can see through is the
 // difference between a halo that is wearing out and one that is coming apart.
-function drawHalo(ctx, cx, cy, fraction, tone) {
+function paintHalo(ctx, cx, cy, fraction, tone) {
   if (!ringBand) ringBand = buildHaloBand();
   const total = ringBand.length / 3;
   const n = Math.ceil(total * clamp(fraction, 0, 1));
@@ -8139,6 +8139,7 @@ function drawHalo(ctx, cx, cy, fraction, tone) {
         ctx.fillRect(cx + ringBand[i * 3], cy + ringBand[i * 3 + 1], 1, 1);
   }
   if (decay <= 0) return;
+  // (paintHalo is only ever called by the cache below, once per distinct picture.)
 
   // The last stretch, running back from the leading edge. `d` is 0 at the tip and 1 where the band
   // is whole again, so the colour and the gaps are both functions of one number: its own shade,
@@ -8270,18 +8271,51 @@ function drawExpiredMark(ctx, cx, cy) {
 const HALO_GOLD = [C.haloLit, C.haloGold, C.haloDeep, C.haloDark, C.haloFade];
 const HALO_RED = [C.suspLit, C.suspicion, C.suspDark, C.suspShade, C.suspFade];
 const HALO_RIOT = [C.ink, C.ink, C.inkDim, C.inkDim, C.inkFaint];
+// Indexed, because the halo cache is keyed on which set was asked for and an array makes a poor
+// key. Order is the cache's business only; `ringColor` names them.
+const HALO_TONES = [HALO_GOLD, HALO_RED, HALO_RIOT];
+
+// The halo is a pure function of how many pixels of arc are lit and which tones they are drawn in:
+// `decay` follows from `n`, and the erosion is hashed on the band pixel rather than on time, which
+// is what makes two halos at the same fraction erode identically. So there are 75 x 3 pictures in
+// the whole game, and they were being rebuilt a pixel at a time, per guest, per frame.
+//
+// That is the load the phone was reporting as "hoarseness that gets worse when there are more
+// souls in the slots and in the basement": an arc is 74 fillRects, a busy lounge is ten or more
+// halos, and at 60 fps that is tens of thousands of canvas draw calls a second competing with the
+// audio thread for four cores. A contract only crosses a 1/74 boundary a couple of times a second,
+// so the same picture was being redrawn from scratch a couple of dozen frames running.
+//
+// Cached as one small canvas each, blitted with a single drawImage. Bounded by construction - one
+// entry per (n, tone set) - so it fills once and never grows.
+const haloCache = {};
+function drawHalo(ctx, cx, cy, fraction, toneIdx) {
+  if (!ringBand) ringBand = buildHaloBand();
+  const total = ringBand.length / 3;
+  const n = Math.ceil(total * clamp(fraction, 0, 1));
+  const key = toneIdx * 256 + n;
+  let cv = haloCache[key];
+  if (!cv) {
+    // The band is centred on the halo's middle pixel, so the canvas is the grid and the painter is
+    // handed that centre in the canvas's own coordinates.
+    cv = makeLayer(HALO_W, HALO_H);
+    paintHalo(cv.getContext('2d'), (HALO_W - 1) / 2, (HALO_H - 1) / 2, fraction, HALO_TONES[toneIdx]);
+    haloCache[key] = cv;
+  }
+  ctx.drawImage(cv, Math.round(cx) - (HALO_W - 1) / 2, Math.round(cy) - (HALO_H - 1) / 2);
+}
 
 function ringColor(guest, time) {
   const st = contractState(guest);
-  if (st === 'active') return HALO_GOLD;
+  if (st === 'active') return 0;             // HALO_GOLD
   if (st === 'expired') {
     // The riot clock used to be reported by the figure flashing red. The roster took that away -
     // thirteen people cannot share a state colour - so it is reported here, faster than any other
     // rhythm on screen, against the solid red of an expiry that is merely standing there.
-    if (guest.riot > 0 && Math.sin(guest.riot * Math.PI * 2 * RIOT_BLINK) < 0) return HALO_RIOT;
-    return HALO_RED;
+    if (guest.riot > 0 && Math.sin(guest.riot * Math.PI * 2 * RIOT_BLINK) < 0) return 2;   // HALO_RIOT
+    return 1;                                // HALO_RED
   }
-  return Math.sin(time * Math.PI * 2 * CONTRACT_PULSE) > 0 ? HALO_RED : HALO_GOLD;
+  return Math.sin(time * Math.PI * 2 * CONTRACT_PULSE) > 0 ? 1 : 0;   // HALO_RED : HALO_GOLD
 }
 
 // A tap on a guest who is still under contract shakes the figure and does nothing else.
