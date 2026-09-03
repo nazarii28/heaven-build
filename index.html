@@ -10892,6 +10892,10 @@ const TICK_MS = 25;
 // live counts NODES, not notes: one voice is 2 to 5 nodes
 let CAP_SOFT = 200, CAP_HARD = 300;
 let running = false, startT = 0, timer = null, cullPrio = 0;
+// A mix quieter than BUS_AUDIBLE is not emitted at all. While two are above it, both play only
+// their channels at BUS_SKELETON and up - lead, counter, pad, choir, bass, drums, choir2 and solo,
+// which is the piece's melody, harmony and pulse without its decoration. See `emit`.
+const BUS_AUDIBLE = .05, BUS_SKELETON = 7;
 const cur = [new Int32Array(16), new Int32Array(16), new Int32Array(16)];
 const chLevel = new Float32Array(16), chMute = new Uint8Array(16);
 let liveCount = 0;
@@ -10996,8 +11000,33 @@ function emit(hU, now){
   // they hold nodes alive far longer than their note count suggests), 5 adds ostin, 6 adds arp
   // and lowstr. Lead, choir, bass, drums and counter are never reachable this way.
   const minPrio = Math.max(cullPrio, liveCount > CAP_HARD ? 8 : liveCount > CAP_SOFT ? 5 : 0);
+  // How many mixes are sounding at once. One is the normal state and plays in full; two means a
+  // crossfade, and that is the case this whole block exists for.
+  let busy = 0;
+  for (let tr = 0; tr < 3; tr++) if (busTarget[tr] > BUS_AUDIBLE) busy++;
   for (let tr = 0; tr < 3; tr++) {
-    const audible = busTarget[tr] > .05;
+    const audible = busTarget[tr] > BUS_AUDIBLE;
+    // A crossfade used to render two COMPLETE arrangements at once. The audibility test is a gain
+    // floor of 5%, and the weights cross over slowly - at Suspicion 15 the heaven and middle mixes
+    // sit at 0.59 each, so every note of both was built. That is the doubling a phone reported as
+    // "it starts lagging when Suspicion rises": not a leak, not a tier, a band of the meter where
+    // the engine simply does twice the work. The bands are wide, too - 8 to 22 and 58 to 74 - so a
+    // run spends real time in them rather than passing through.
+    //
+    // So a mix that is not carrying the moment is played as a skeleton rather than in full. Above
+    // BUS_SOLO it is essentially alone and gets everything; below that it keeps priority 7 and up,
+    // which is lead, counter, choir, bass, drums, pad, choir2 and solo - enough to be recognisably
+    // itself and to fade in and out as itself, without its decoration. Two skeletons cost about
+    // what one full arrangement does, which is what the crossfade used to cost before it doubled.
+    //
+    // BOTH mixes thin, not just the quieter one. Leaving the dominant mix full cannot get the
+    // crossfade below about 1.4x a single arrangement, because the dominant mix on its own already
+    // costs 1.05x - measured across the whole meter, not guessed. Thinning both puts the worst
+    // point at 1.08x, which is what one mix costs, so the crossfade stops being a spike at all.
+    //
+    // Counted rather than ranked: at the centre of a fade the two weights are equal to within
+    // rounding, and a rule that had to pick a winner would flicker between them as the meter drips.
+    const busFloor = busy > 1 ? BUS_SKELETON : 0;
     const rset = REC[tr];
     for (let ch = 0; ch < 16; ch++) {
       const c = DATA[tr][ch];
@@ -11011,7 +11040,7 @@ function emit(hU, now){
       while (i < c.n && c.t[i] < hU) {
         const u = c.t[i], t0 = startT + uToSec(u);
         if (t0 > now - .02) {
-          if (PRIO[ch] >= minPrio) {
+          if (PRIO[ch] >= minPrio && PRIO[ch] >= busFloor) {
             const amp = (c.v[i] / 127) * VOL[ch] * dynAt(u, tr, role);
             const durS = Math.max(.04, uToSec(u + c.d[i]) - uToSec(u));
             if (ch === 9) drum(t0, c.p[i], amp * 1.15, tr, ch);
