@@ -696,9 +696,18 @@ const SOUND_BTN = { w: 11, h: 11 };
 // nothing, the cost is not the fixed graph at all. It is what a note costs to build, and 'low' was
 // only fixing that by accident, alongside everything else it throws away.
 //
-// 'mid' is the tier written for that measurement, and 'auto' gives it to every touch device: the
-// same arrangement, the same hall, the same reverb as the desktop, out of about a third of the
-// nodes per note. See the qLevel comment in 98_audio_engine.js for where those nodes were going.
+// 'mid' was written for that measurement and did not survive it either - it crackled too, and no
+// rung of the CULL dial saved it, which ruled out note count as well. Only 'low' is clean on that
+// phone, so 'auto' gives touch devices 'low'.
+//
+// What makes that acceptable is that 'low' is no longer the sacrifice it was. Everything the tier
+// used to drag along that the measurements could not justify has been taken out of it: it has the
+// full stereo hall, every channel of the arrangement and the desktop's caps, and differs in one
+// way only - one oscillator layer per voice instead of three, and no per-note modulators.
+//
+// The choice was also made against an engine that leaked audio nodes for the length of a run,
+// which is now fixed, so the tier above may fit after all. See the qLevel comment in
+// 98_audio_engine.js for where the nodes go, and reg() for what was leaking.
 const AUDIO_QUALITY = 'auto';
 
 // The twenty-two cues also exist as one rendered file, and the engine can play either. 'synth' is
@@ -1490,11 +1499,16 @@ function toggleSound() {
   if (audioReady) WTHAudio.volume(soundOn ? MUSIC_VOLUME : 0);
 }
 
-// Which tier this device gets. A phone was measured at both ends: 'high' crackles on it, 'low' does
-// not, and turning the reverb off changed nothing either way - so the cost is the node count of a
-// note, not the fixed graph. 'mid' is the tier written for that finding, and it is what a touch
-// device gets: the same arrangement and the same hall as the desktop, built out of about a third of
-// the nodes. 'low' stays as the rung below, unused by default, for a device mid cannot satisfy.
+// Which tier this device gets. Measured, then measured again: 'high' crackles on the test phone,
+// 'mid' crackles too and every rung of CULL failed to save it, 'low' is clean. So a touch device
+// gets 'low' - which is no longer the sacrifice it was, because everything in that tier that the
+// measurements could not justify has been taken out of it. It now has the full stereo hall, every
+// channel of the arrangement and the same caps as the desktop, and differs in exactly one way: one
+// oscillator layer per voice instead of three, and no per-note modulators.
+//
+// This is a floor, not a verdict. It was chosen against an engine that leaked nodes for the length
+// of a run, and the leak is now fixed; the tier above may well fit. The panel cycles, so the phone
+// can say so.
 //
 // `pointer: coarse` is the test rather than a user-agent string: it asks what the device is being
 // driven with, which is the thing that correlates with a small battery-powered chip, and it does
@@ -1504,7 +1518,7 @@ function detectAudioQuality() {
   if (AUDIO_QUALITY !== 'auto') return AUDIO_QUALITY;
   const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
   const cores = navigator.hardwareConcurrency || 8;
-  return (coarse || cores <= 4) ? 'mid' : 'high';
+  return (coarse || cores <= 4) ? 'low' : 'high';
 }
 
 // The browser will not create an AudioContext outside a real user gesture, and our own input
@@ -1515,9 +1529,9 @@ function detectAudioQuality() {
 function unlockAudio() {
   if (audioReady) return;
   audioReady = true;
-  // Before init(), not after: the tier decides the length of the reverb impulse, whether the
-  // shaper oversamples and how big an output buffer to ask the device for, and all three are
-  // fixed at the moment the context is created.
+  // Before init(), not after. Most of what the tier does now moves at runtime, but whether the
+  // distortion shaper oversamples is decided when the context is built and cannot be changed
+  // afterwards - so a tier chosen after this call would be a tier missing a piece.
   WTHAudio.quality(detectAudioQuality());
   WTHAudio.init();
   // Muted before the context existed is still muted: the toggle can be pressed on the title screen,
@@ -1546,9 +1560,12 @@ function sfx(name) {
   if (cue) WTHAudio.sfx(cue);
 }
 
-// The engine wants the meter whenever it moves and says every frame is fine: the crossfade between
-// its three mixes is its own smoothing. The two tier crossings get a sting on the way up only -
-// going back down is relief, and relief that announces itself is just another alarm.
+// Called every simulation step, which is 60 times a second. That used to reach all the way into
+// the graph and cost seven AudioParam events and a rebuilt distortion curve each time; the engine
+// now drops a call whose meter has not moved a quarter of a point, so this stays a plain "tell it
+// whenever it changes" and the throttling lives where the cost is. The two tier crossings get a
+// sting on the way up only - going back down is relief, and relief that announces itself is just
+// another alarm.
 function audioSuspicion(v) {
   if (!audioReady) return;
   WTHAudio.setSuspicion(v);
@@ -10547,12 +10564,13 @@ function initAudio(){
   color.type = 'lowpass'; color.frequency.value = 11000;
   color.connect(musicGain);
 
-  // The reverb is the single most expensive node in the graph: a 4.6 s stereo impulse is a
-  // quarter of a million taps per channel, running whether or not anything is being sent to it.
-  // The low tier keeps a hall - the music is written around one - but a mono, 1.4 s one, which
-  // is roughly a sixth of the work and still reads as a room.
+  // The same hall on every tier. It is the most expensive single node in the graph and the low
+  // tier used to get a mono 1.4 s impulse instead, which was the largest audible sacrifice the
+  // tier made - and a phone reported that turning the reverb off entirely changed nothing it
+  // could hear as a difference in load. A cost that cannot be measured is not worth the room it
+  // was taking out of the music. `reverb(false)` still exists for a device that disagrees.
   hall = AC.createConvolver();
-  hall.buffer = qLevel ? makeIR(4.6, 1.9, .55, 2) : makeIR(1.4, 1.6, .5, 1);
+  hall.buffer = makeIR(4.6, 1.9, .55, 2);
   const hallLP = AC.createBiquadFilter();
   hallLP.type = 'lowpass'; hallLP.frequency.value = 6800;
   hallRet = AC.createGain(); hallRet.gain.value = 1.0;
@@ -10616,10 +10634,22 @@ let qLevel = 2, reverbOn = true;
 // only the first. One vibrato across a stack of three near-identical detuned oscillators is very
 // nearly the same sound as three; three times the nodes is not very nearly the same cost.
 let uniMax = 3, modsAll = true;
-function reg(node, end, st){ live.push({ e: end, n: node, s: st }); }
+// `dc` marks the node at the END of a voice's chain - the one wired into a permanent pan or bus
+// node. Nothing in this engine ever disconnected anything: an oscillator stops itself, but the gain
+// and filter it fed stay wired into the always-on graph, waiting for the collector to notice they
+// are orphaned. At a couple of hundred nodes a second that is a rendering graph that GROWS for the
+// length of a run, and the audio thread walks it every 128 samples - which is why the fault came on
+// partway through a session rather than at the start, and why the cheapest tier survived longest
+// rather than sounding different in kind.
+//
+// Disconnecting the terminal node detaches the whole chain behind it in one call, since nothing
+// upstream is referenced anywhere else once its source has finished.
+function reg(node, end, st, dc){ live.push({ e: end, n: node, s: st, d: dc }); }
 function killAll(){
   const t = AC.currentTime;
-  for (const L of live) { try { L.n.stop(Math.max(t, L.s)); } catch (e) {} }
+  for (const L of live) {
+    try { if (L.d) L.n.disconnect(); else L.n.stop(Math.max(t, L.s)); } catch (e) {}
+  }
   live = [];
 }
 
@@ -10646,6 +10676,7 @@ function sub(t0, f, dur, rec, out, amp, cents, midi, mod){
   node.connect(out);
 
   const peak = rec.g * amp, sLev = rec.sus ? Math.max(.0002, peak * rec.s) : 0;
+  const term = node;                       // detached once the voice has finished; see reg()
   g.gain.setValueAtTime(.0001, t0);
   g.gain.linearRampToValueAtTime(peak, t0 + rec.a);
   let stopAt;
@@ -10668,6 +10699,7 @@ function sub(t0, f, dur, rec, out, amp, cents, midi, mod){
   o.frequency.setValueAtTime(f, t0);
   if (cents) o.detune.setValueAtTime(cents, t0);
   o.connect(g); o.start(t0); o.stop(stopAt); reg(o, stopAt, t0);
+  reg(term, stopAt, t0, true);
 
   if (rec.sub) {                                 // low end under the bass
     const s2 = AC.createOscillator(); s2.type = 'sine';
@@ -10730,6 +10762,7 @@ function noiseAt(t0, dur, bp, q, vol, out, sweepTo){
   g.gain.exponentialRampToValueAtTime(.0001, t0 + dur);
   src.connect(f); f.connect(g); g.connect(out);
   src.start(t0, off); src.stop(t0 + dur + .02); reg(src, t0 + dur + .02, t0);
+  reg(g, t0 + dur + .02, t0, true);
 }
 
 function drum(t0, note, amp, tr, ch, style){
@@ -10744,6 +10777,7 @@ function drum(t0, note, amp, tr, ch, style){
     g.gain.exponentialRampToValueAtTime(.0001, t0 + t);
     o.connect(g); g.connect(out); o.start(t0); o.stop(t0 + t + .04);
     reg(o, t0 + t + .04, t0);
+    reg(g, t0 + t + .04, t0, true);
   };
   if (note === 36) {
     tone(heavy ? 155 : 118, heavy ? 41 : 49, heavy ? .42 : .3, amp * (heavy ? .9 : soft ? .48 : .74));
@@ -10864,15 +10898,27 @@ let liveCount = 0;
 
 // Applies everything the tier decides that is not frozen into the graph at init. `quality` itself
 // is read per note by `sub` and `voice`; these three are read by the scheduler.
+// The tier now moves ONE thing: what a voice costs to build. Everything else it used to drag along
+// was measured on a phone and found not to be carrying anything.
+//
+//   the hall      - HALL OFF changed nothing at either end, so low no longer gets a short mono
+//                   impulse. It was the largest audible sacrifice in the tier and bought nothing.
+//   the channels  - low used to silence everything at priority 3 or under. CULL 6 silences more
+//                   than that and did not help mid, so note count is not the lever either. The
+//                   flat rule is gone; the CULL dial remains, and CULL 4 reproduces it exactly if
+//                   the measurement ever turns around.
+//   the caps      - same ceiling for every tier. They are a load-driven safety net, and a tier
+//                   whose notes are already cheap does not need a tighter one.
+//
+// What is left is the finding: this phone can afford about one oscillator layer and no modulators.
+// That is low's synthesis cost with high's arrangement, which is strictly better music for exactly
+// the same bill.
 function applyTier(){
   uniMax   = qLevel === 2 ? 3 : qLevel === 1 ? 2 : 1;
   modsAll  = qLevel === 2;
-  // Mid keeps high's lookahead and caps on purpose. Its notes are cheaper, so the same ceiling
-  // holds more of them, and tightening it would start dropping parts of an arrangement that is
-  // otherwise complete - which is low's job, not mid's.
-  AHEAD    = qLevel ? .25 : .34;
-  CAP_SOFT = qLevel ? 200 : 110;
-  CAP_HARD = qLevel ? 300 : 170;
+  AHEAD    = qLevel ? .25 : .34;      // the wider lookahead is free, so the cheap tier keeps it
+  CAP_SOFT = 200;
+  CAP_HARD = 300;
 }
 
 // Counts, and does nothing else. A tick arriving far later than the 25 ms it asked for means the
@@ -10914,10 +10960,18 @@ function pump(){
   // Compacted in place rather than filtered into a new array: this runs forty times a second for
   // the length of a run, and a fresh 200-entry array each time is garbage the main thread has to
   // collect - during which it is not scheduling notes.
-  let k = 0;
-  for (let i = 0; i < live.length; i++) if (live[i].e > now) live[k++] = live[i];
+  let k = 0, sounding = 0;
+  for (let i = 0; i < live.length; i++) {
+    const L = live[i];
+    if (L.e > now) { live[k++] = L; if (!L.d) sounding++; }
+    else if (L.d) { try { L.n.disconnect(); } catch (e) {} }
+  }
   live.length = k;
-  liveCount = k;
+  // Counts SOURCES, not registry entries. Every voice now also registers its terminal node so the
+  // chain can be detached when it ends, and counting those would halve CAP_SOFT and CAP_HARD
+  // without anyone changing them - the caps are calibrated against oscillators and buffer sources,
+  // which is what actually costs the audio thread anything.
+  liveCount = sounding;
   watchLateness(now);
 
   let hSec = now - startT + AHEAD;
@@ -10942,7 +10996,6 @@ function emit(hU, now){
   // they hold nodes alive far longer than their note count suggests), 5 adds ostin, 6 adds arp
   // and lowstr. Lead, choir, bass, drums and counter are never reachable this way.
   const minPrio = Math.max(cullPrio, liveCount > CAP_HARD ? 8 : liveCount > CAP_SOFT ? 5 : 0);
-  const lowQ = !qLevel;
   for (let tr = 0; tr < 3; tr++) {
     const audible = busTarget[tr] > .05;
     const rset = REC[tr];
@@ -10958,7 +11011,7 @@ function emit(hU, now){
       while (i < c.n && c.t[i] < hU) {
         const u = c.t[i], t0 = startT + uToSec(u);
         if (t0 > now - .02) {
-          if (PRIO[ch] >= minPrio && !(lowQ && PRIO[ch] <= 3)) {
+          if (PRIO[ch] >= minPrio) {
             const amp = (c.v[i] / 127) * VOL[ch] * dynAt(u, tr, role);
             const durS = Math.max(.04, uToSec(u + c.d[i]) - uToSec(u));
             if (ch === 9) drum(t0, c.p[i], amp * 1.15, tr, ch);
@@ -11145,6 +11198,7 @@ function sT(t0, f, dur, o){
     flt.type = 'lowpass'; flt.frequency.value = o.f; g.connect(flt); node = flt; }
   node.connect(o.out || sfxBus);
   osc.connect(g); osc.start(t0); osc.stop(t0 + dur + .05); reg(osc, t0 + dur + .05, t0);
+  reg(node, t0 + dur + .05, t0, true);
 }
 
 function duck(amount, dur){
@@ -11254,6 +11308,7 @@ function playSlice(t, off, len, gain){
   src.start(t, off, dur);
   src.stop(t + dur + .02);
   reg(src, t + dur + .02, t);
+  reg(g, t + dur + .02, t, true);
 }
 
 // The same rule the synthesised path uses: every mode above the audibility floor sounds at
