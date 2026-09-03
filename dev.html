@@ -993,19 +993,63 @@ const FONT = {
 // No canvas font API is used anywhere in the game: at a 216 px buffer a vector font antialiases
 // into grey mush and the integer upscale turns that mush into fringing.
 
+// A glyph baked into its own small canvas, one per character, colour and size, and kept.
+//
+// The table is bitmasks, and painting one meant a `fillRect` PER LIT PIXEL - a 7x9 box is up to 63
+// of them for one character. A screen of this game carries a few hundred characters between the
+// HUD, the card, the floor labels and the popups, and every one of them was rebuilt from its
+// bitmask on every frame: a hundred thousand canvas draw calls a second to redraw text that had
+// not changed since the game booted. On a desktop that is invisible. On a four-core phone it is a
+// slice the audio thread needed, which is what came back as crackle whenever the screen got busy.
+//
+// Bounded in practice: every colour handed to this comes from the palette in `C`, so the set of
+// keys is the alphabet times a dozen colours times two sizes. The cap is a guard against a caller
+// that one day computes a colour, not a real limit - past it, drawing falls back to the old path
+// rather than failing or growing without end.
+const glyphCache = {};
+let glyphCount = 0;
+const GLYPH_CACHE_MAX = 4000;
+
+function glyphCanvas(ch, color, px) {
+  const key = px + color + ch;      // px is a digit, colour a fixed-length hex, ch one character
+  const hit = glyphCache[key];
+  if (hit !== undefined) return hit;
+  if (glyphCount >= GLYPH_CACHE_MAX) return null;
+  const g = FONT[ch] || FONT['?'];
+  const cv = makeLayer((FONT_W + FONT_X) * px, FONT_H * px);
+  const gc = cv.getContext('2d');
+  gc.fillStyle = color;
+  for (let r = 0; r < FONT_H; r++) {
+    const bits = g[r + 1];
+    if (!bits) continue;
+    for (let c = 0; c < FONT_W; c++)
+      if (bits & (1 << (FONT_W - 1 - c))) gc.fillRect((c + FONT_X) * px, r * px, px, px);
+  }
+  glyphCache[key] = cv; glyphCount++;
+  return cv;
+}
+
 // x is the left edge, y is the TOP row of the glyph box (a line occupies FONT_H rows downward).
 // px is the pixel size: 1 for body text, 2 for headings. Returns the advanced width.
+//
+// The blit is rounded. Advances are whole pixels, so a run started on an integer stays on one, and
+// a caller that hands this a fraction was asking a pixel font to land between pixels - which the
+// old path answered with an antialiased smear, and this one answers by putting it on the grid.
 function drawText(ctx, text, x, y, color, px) {
   px = px || 1;
-  ctx.fillStyle = color;
   let cx = x;
+  const gy = Math.round(y);
   for (const ch of text) {
     const g = FONT[ch] || FONT['?'];
-    for (let r = 0; r < FONT_H; r++) {
-      const bits = g[r + 1];
-      if (!bits) continue;
-      for (let c = 0; c < FONT_W; c++) {
-        if (bits & (1 << (FONT_W - 1 - c))) ctx.fillRect(cx + (c + FONT_X) * px, y + r * px, px, px);
+    const cv = glyphCanvas(ch, color, px);
+    if (cv) ctx.drawImage(cv, Math.round(cx), gy);
+    else {
+      ctx.fillStyle = color;
+      for (let r = 0; r < FONT_H; r++) {
+        const bits = g[r + 1];
+        if (!bits) continue;
+        for (let c = 0; c < FONT_W; c++)
+          if (bits & (1 << (FONT_W - 1 - c))) ctx.fillRect(cx + (c + FONT_X) * px, y + r * px, px, px);
       }
     }
     cx += g[0] * px;
