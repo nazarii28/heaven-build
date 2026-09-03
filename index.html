@@ -4408,6 +4408,30 @@ function updateFx(dt) {
 
 const Sprites = { cache: {} };
 
+// A palette value resolved to its three bytes, remembered. Every value in this build is `#rrggbb` -
+// the game palette `C` and the art packs' own literals both - so the parse is three slices, and the
+// cache means it happens once per colour in the game rather than once per pixel drawn.
+const SpriteRGB = {};
+function spriteRGB(value) {
+  let v = SpriteRGB[value];
+  if (v) return v;
+  const hex = value.charAt(0) === '#' ? value : C[value];
+  v = SpriteRGB[value] = [parseInt(hex.slice(1, 3), 16),
+                          parseInt(hex.slice(3, 5), 16),
+                          parseInt(hex.slice(5, 7), 16)];
+  return v;
+}
+
+// One `putImageData` per frame, where this used to issue a `fillRect` per PIXEL. The card blank is
+// 196x72, so its bake was fourteen thousand canvas draw calls in the single frame where the card
+// first appears - and since bakes are lazy, every one of them lands during play, on whatever frame
+// first shows that sprite. On a phone that was showing up as ~100 ms stalls of the main thread,
+// which on four cores is enough to take the audio thread's slice away with it: the "occasional"
+// crackle that survived every audio-side fix arrived when a new sprite did.
+//
+// The output is identical. `createImageData` hands back zeroed bytes, so a '.' left alone is
+// already a transparent pixel, and the canvas is w x h with no transform, so raw pixels land
+// exactly where the 1x1 rectangles did.
 function bakeSprite(def, frame) {
   const i = frame || 0;
   const key = def.key + ':' + i;
@@ -4417,16 +4441,19 @@ function bakeSprite(def, frame) {
   const rows = def.frames ? def.frames[i] : def.rows;
   const layer = makeLayer(def.w, def.h);
   const g = layer.getContext('2d');
+  const img = g.createImageData(def.w, def.h);
+  const d = img.data;
+  let p = 0;
   for (let y = 0; y < def.h; y++) {
     const row = rows[y];
-    for (let x = 0; x < def.w; x++) {
+    for (let x = 0; x < def.w; x++, p += 4) {
       const ch = row[x];
       if (ch === '.') continue;
-      const c = def.pal[ch];
-      g.fillStyle = c.charAt(0) === '#' ? c : C[c];
-      g.fillRect(x, y, 1, 1);
+      const rgb = spriteRGB(def.pal[ch]);
+      d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255;
     }
   }
+  g.putImageData(img, 0, 0);
   Sprites.cache[key] = layer;
   return layer;
 }
