@@ -10849,6 +10849,7 @@ function applySuspicion(force){
   // assignment only happens on a step change, so the shaper is left alone for seconds at a time.
   const di = Math.round(smoothstep(suspicion, 70, 100) * (DIST_STEPS - 1));
   if (di !== distIdx) { distIdx = di; shaper.curve = distTable[di]; }
+  wireHell(busTarget[2] > BUS_AUDIBLE);
 }
 function setSuspicion(v){ suspicion = clamp(v, 0, 100); applySuspicion(); }
 
@@ -10856,6 +10857,24 @@ function setSuspicion(v){ suspicion = clamp(v, 0, 100); applySuspicion(); }
 // has no way of knowing its tail has run out - so a wet send held at zero gain costs the machine
 // exactly what a loud one does. Pulling the connection is what buys the CPU back; the send is
 // faded first and the wire cut afterwards, so the hall empties instead of stopping dead.
+// The hell mix is the only thing routed through the distortion shaper, and it is silent below
+// Suspicion 58 - but `bus[2]` was wired into the shaper at init and left there, so a node doing
+// 2x-oversampled waveshaping ran every 128 samples for the whole of every run, including the
+// nine tenths of one where nothing was going through it. Oversampling carries latency, so the
+// node does not get to pass silence along and skip its work the way a plain filter would.
+//
+// Wired the moment the mix becomes audible - the gain fade takes 0.9 s, so there is no hurry -
+// and cut a second and a half after it goes quiet, once that fade has finished. `bus[2]` has
+// exactly one outgoing connection, so the bare disconnect is unambiguous.
+let hellWired = true, hellTimer = null;
+function wireHell(on){
+  if (!AC || on === hellWired) return;
+  hellWired = on;
+  clearTimeout(hellTimer);
+  if (on) bus[2].connect(shaper);
+  else hellTimer = setTimeout(function(){ try { bus[2].disconnect(); } catch (e) {} }, 1600);
+}
+
 let revTimer = null;
 function setReverb(on){
   reverbOn = !!on;
