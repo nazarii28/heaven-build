@@ -690,21 +690,16 @@ const MUSIC_VOLUME = 0.75;        // handed to the engine on the first tap
 // on the canvas - 38 px square around an 11 px glyph. The consumable slots have to be kept clear
 // of it by hand; see SUPPLY_SLOT.right.
 const SOUND_BTN = { w: 11, h: 11 };
-// 'high' | 'low' | 'auto'. The phone crackles, and the first thing tried was 'auto': hand every
-// touch device the cheap tier. It worked and it cost too much - a shorter mono hall, one voice per
-// note instead of three, no vibrato, and 60 ms between a swipe and its stamp. The goal is a phone
-// that sounds like the desktop, so that trade is only worth making if it is the only one left.
+// 'auto' | 'high' | 'mid' | 'low'. Measured on a phone rather than guessed: 'high' crackles on it,
+// 'low' does not, and HALL OFF made no difference at either end. That last one is the informative
+// result - the reverb is the most expensive single node in the graph, so if removing it changes
+// nothing, the cost is not the fixed graph at all. It is what a note costs to build, and 'low' was
+// only fixing that by accident, alongside everything else it throws away.
 //
-// It probably is not. The same session found a fault that was costing far more than any of it: the
-// drums were generating their noise sample by sample on the main thread, inside the scheduler tick.
-// That is fixed, it is fixed on every device, and it changes nothing about how the game sounds. So
-// the tier goes back to 'high' and the phone is asked again with that one fault gone.
-//
-// If it still crackles, the ladder is: turn the reverb off (HALL in the dev panel - it is the most
-// expensive single node by a wide margin and the only one that can be dropped without touching a
-// note), then 'low', then 'auto'. All three paths are live and the dev panel flips the last two on
-// the device. See detectAudioQuality() in 07_audio.js for what 'auto' decides.
-const AUDIO_QUALITY = 'high';
+// 'mid' is the tier written for that measurement, and 'auto' gives it to every touch device: the
+// same arrangement, the same hall, the same reverb as the desktop, out of about a third of the
+// nodes per note. See the qLevel comment in 98_audio_engine.js for where those nodes were going.
+const AUDIO_QUALITY = 'auto';
 
 // The twenty-two cues also exist as one rendered file, and the engine can play either. 'synth' is
 // what ships: it costs nothing to load, cannot fail, and sounds the same on a phone that refused
@@ -1495,21 +1490,21 @@ function toggleSound() {
   if (audioReady) WTHAudio.volume(soundOn ? MUSIC_VOLUME : 0);
 }
 
-// Which tier this device gets. AUDIO_QUALITY names it outright for testing; 'auto' - what ships -
-// asks the question the config comment left open at step 12, and a real phone answered it: the
-// high tier crackles on one. So every touch device gets the low tier, including the fast ones.
-// The difference the player hears is thinner unison and a shorter hall; the difference they hear
-// when we guess the other way is the speaker tearing, which is not a trade.
+// Which tier this device gets. A phone was measured at both ends: 'high' crackles on it, 'low' does
+// not, and turning the reverb off changed nothing either way - so the cost is the node count of a
+// note, not the fixed graph. 'mid' is the tier written for that finding, and it is what a touch
+// device gets: the same arrangement and the same hall as the desktop, built out of about a third of
+// the nodes. 'low' stays as the rung below, unused by default, for a device mid cannot satisfy.
 //
 // `pointer: coarse` is the test rather than a user-agent string: it asks what the device is being
 // driven with, which is the thing that correlates with a small battery-powered chip, and it does
 // not need a list of phone names kept up to date. A desktop with a touchscreen would be caught by
-// it wrongly - and would sound slightly thinner for it, which is the harmless direction.
+// it wrongly - and would lose one of three detuned copies for it, which is the harmless direction.
 function detectAudioQuality() {
   if (AUDIO_QUALITY !== 'auto') return AUDIO_QUALITY;
   const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
   const cores = navigator.hardwareConcurrency || 8;
-  return (coarse || cores <= 4) ? 'low' : 'high';
+  return (coarse || cores <= 4) ? 'mid' : 'high';
 }
 
 // The browser will not create an AudioContext outside a real user gesture, and our own input
@@ -10522,7 +10517,7 @@ function initAudio(){
   // The low tier keeps a hall - the music is written around one - but a mono, 1.4 s one, which
   // is roughly a sixth of the work and still reads as a room.
   hall = AC.createConvolver();
-  hall.buffer = quality ? makeIR(4.6, 1.9, .55, 2) : makeIR(1.4, 1.6, .5, 1);
+  hall.buffer = qLevel ? makeIR(4.6, 1.9, .55, 2) : makeIR(1.4, 1.6, .5, 1);
   const hallLP = AC.createBiquadFilter();
   hallLP.type = 'lowpass'; hallLP.frequency.value = 6800;
   hallRet = AC.createGain(); hallRet.gain.value = 1.0;
@@ -10534,7 +10529,7 @@ function initAudio(){
   // '2x' oversampling doubles the sample rate through the shaper to keep the aliasing out of
   // the hell mix. It is a luxury: on the low tier the shaper runs at rate and the aliasing it
   // lets through lands in a bus that is already meant to sound damaged.
-  shaper.curve = distCurve(1); shaper.oversample = quality ? '2x' : 'none';
+  shaper.curve = distCurve(1); shaper.oversample = qLevel ? '2x' : 'none';
   shaper.connect(color);
 
   for (let tr = 0; tr < 3; tr++) {
@@ -10559,7 +10554,31 @@ function initAudio(){
 function ctx(){ initAudio(); if (AC.state === 'suspended') AC.resume(); return AC; }
 
 let live = [];
-let quality = 1, reverbOn = true;
+// 2 = high, 1 = mid, 0 = low. It was a flag until a phone reported that HALL OFF changed nothing
+// and AQ LOW fixed everything, which said the cost is not in the fixed graph but in what a note
+// costs to build - and left nothing in between the two to try. Where the nodes go, for a pad at
+// high with fm, vibrato, tremolo and air:
+//
+//   3 unison layers x (osc + gain + filter)      9
+//   + sub oscillator x 3                         6
+//   + fm oscillator and depth gain x 3           6
+//   + vibrato oscillator and depth gain x 3      6
+//   + tremolo oscillator and depth gain x 3      6
+//   + air noise, filter and gain x 3             9
+//                                               42 nodes, for one note
+//
+// The multiplier is the whole story: `sub()` is called once per unison layer and each layer builds
+// its own modulators, so a third voice does not cost a third more, it costs a third of forty-two.
+// Mid takes the two multiplications out - two layers instead of three, and modulators built once
+// for the note rather than once per layer - which is the same note, 12 nodes instead of 42. What
+// it does NOT do is what low does besides: low also silences every channel at priority 3 or under,
+// drops the modulators entirely and shortens the hall, and that is why low is audibly a different
+// arrangement rather than the same one played more cheaply.
+let qLevel = 2, reverbOn = true;
+// How many detuned copies a voice may use, and whether the modulators are built for every copy or
+// only the first. One vibrato across a stack of three near-identical detuned oscillators is very
+// nearly the same sound as three; three times the nodes is not very nearly the same cost.
+let uniMax = 3, modsAll = true;
 function reg(node, end, st){ live.push({ e: end, n: node, s: st }); }
 function killAll(){
   const t = AC.currentTime;
@@ -10571,7 +10590,7 @@ const UNI_IDX = { 1: [1], 2: [0, 2], 3: [0, 1, 2] };
 const UNI_DET = { 1: [0], 2: [-1, 1], 3: [-1, 0, 1] };
 
 // one layer of unison
-function sub(t0, f, dur, rec, out, amp, cents, midi){
+function sub(t0, f, dur, rec, out, amp, cents, midi, mod){
   const g = AC.createGain();
   let node = g;
   if (rec.f) {
@@ -10581,7 +10600,7 @@ function sub(t0, f, dur, rec, out, amp, cents, midi){
     if (rec.fe) {
       flt.frequency.setValueAtTime(base * rec.fe, t0);
       flt.frequency.exponentialRampToValueAtTime(base, t0 + Math.min(.4, dur));
-    } else if (rec.fslow && quality) {          // pads open up rather than just standing there
+    } else if (rec.fslow && qLevel) {           // pads open up rather than just standing there
       flt.frequency.setValueAtTime(base / rec.fslow, t0);
       flt.frequency.exponentialRampToValueAtTime(base, t0 + Math.min(2.2, dur + .4));
     } else flt.frequency.setValueAtTime(base, t0);
@@ -10620,7 +10639,7 @@ function sub(t0, f, dur, rec, out, amp, cents, midi){
     s2.connect(sg); sg.connect(g);
     s2.start(t0); s2.stop(stopAt); reg(s2, stopAt, t0);
   }
-  if (rec.fm && quality) {
+  if (rec.fm && mod) {
     const m = AC.createOscillator(); m.type = 'sine';
     m.frequency.setValueAtTime(f * rec.fm[0], t0);
     const mg = AC.createGain();
@@ -10629,7 +10648,7 @@ function sub(t0, f, dur, rec, out, amp, cents, midi){
     m.connect(mg); mg.connect(o.frequency);
     m.start(t0); m.stop(stopAt); reg(m, stopAt, t0);
   }
-  if (rec.vib && quality) {
+  if (rec.vib && mod) {
     const l = AC.createOscillator(); l.type = 'sine';
     l.frequency.value = rec.vib[0] * (.9 + Math.random() * .2);  // each one its own
     const lg = AC.createGain();
@@ -10638,21 +10657,22 @@ function sub(t0, f, dur, rec, out, amp, cents, midi){
     l.connect(lg); lg.connect(o.detune);
     l.start(t0); l.stop(stopAt); reg(l, stopAt, t0);
   }
-  if (rec.trem && quality) {
+  if (rec.trem && mod) {
     const l = AC.createOscillator(); l.type = 'sine'; l.frequency.value = rec.trem[0];
     const lg = AC.createGain(); lg.gain.value = peak * rec.trem[1];
     l.connect(lg); lg.connect(g.gain);
     l.start(t0); l.stop(stopAt); reg(l, stopAt, t0);
   }
-  if (rec.air && quality) noiseAt(t0, Math.min(dur, .8), f * 2.6, 1.4, peak * rec.air, out);
+  if (rec.air && mod) noiseAt(t0, Math.min(dur, .8), f * 2.6, 1.4, peak * rec.air, out);
 }
 
 function voice(t0, f, dur, rec, tr, ch, amp, midi){
-  const uni = quality ? rec.uni : 1;
+  const uni = Math.min(rec.uni, uniMax);
   const idx = UNI_IDX[uni], det = UNI_DET[uni];
   const a = amp / Math.sqrt(uni);
   for (let k = 0; k < uni; k++)
-    sub(t0 + k * .006, f, dur, rec, pan[tr][ch][idx[k]], a, det[k] * rec.det, midi);
+    sub(t0 + k * .006, f, dur, rec, pan[tr][ch][idx[k]], a, det[k] * rec.det, midi,
+        qLevel > 0 && (modsAll || k === 0));
 }
 
 // Every noise hit reads a window out of the one buffer built at init, from a random offset so
@@ -10789,9 +10809,14 @@ let liveCount = 0;
 // Applies everything the tier decides that is not frozen into the graph at init. `quality` itself
 // is read per note by `sub` and `voice`; these three are read by the scheduler.
 function applyTier(){
-  AHEAD    = quality ? .25 : .34;
-  CAP_SOFT = quality ? 200 : 110;
-  CAP_HARD = quality ? 300 : 170;
+  uniMax   = qLevel === 2 ? 3 : qLevel === 1 ? 2 : 1;
+  modsAll  = qLevel === 2;
+  // Mid keeps high's lookahead and caps on purpose. Its notes are cheaper, so the same ceiling
+  // holds more of them, and tightening it would start dropping parts of an arrangement that is
+  // otherwise complete - which is low's job, not mid's.
+  AHEAD    = qLevel ? .25 : .34;
+  CAP_SOFT = qLevel ? 200 : 110;
+  CAP_HARD = qLevel ? 300 : 170;
 }
 
 // Counts, and does nothing else. A tick arriving far later than the 25 ms it asked for means the
@@ -10804,13 +10829,18 @@ function applyTier(){
 // ticks. That was removed rather than tuned: a mix that thins by itself when the game gets busy
 // is a worse thing to hear than either mix, and it makes every measurement ambiguous - you can no
 // longer tell whether what you are listening to is the build you shipped.
-let lateHits = 0, worstGap = 0, lastTick = 0;
+// The threshold is 50 ms over the tick, not 120: at 120 the first phone read L0 next to a worst gap
+// of 125 ms, which is a stall of a hundred milliseconds reported as nothing at all. A counter whose
+// threshold sits above the events it is meant to count is worse than no counter, because zero looks
+// like an answer.
+let lateHits = 0, worstGap = 0, lastTick = 0, peakLive = 0;
 function watchLateness(now){
   if (lastTick) {
     const gap = now - lastTick;
     if (gap > worstGap) worstGap = gap;
-    if (gap > TICK_MS / 1000 + .12) lateHits++;
+    if (gap > TICK_MS / 1000 + .05) lateHits++;
   }
+  if (liveCount > peakLive) peakLive = liveCount;
   lastTick = now;
 }
 
@@ -10848,7 +10878,7 @@ function pump(){
 let dropped = 0;
 function emit(hU, now){
   const minPrio = liveCount > CAP_HARD ? 8 : liveCount > CAP_SOFT ? 5 : 0;
-  const lowQ = !quality;
+  const lowQ = !qLevel;
   for (let tr = 0; tr < 3; tr++) {
     const audible = busTarget[tr] > .05;
     const rset = REC[tr];
@@ -11296,11 +11326,18 @@ return {
     return this;
   },
 
-  /** 'high' - full unison and vibrato; 'low' - half the cost, for weak phones.
-   *  Can be switched while playing, but call it BEFORE init() to get the whole saving: the
-   *  reverb length, the shaper's oversampling and the size of the output buffer are decided
-   *  when the context is built and cannot be changed afterwards. */
-  quality(mode){ quality = mode === 'low' ? 0 : 1; applyTier(); return this; },
+  /** 'high' - three detuned copies per voice, each with its own modulators.
+   *  'mid'  - two copies, modulators built once per note instead of once per copy. Same
+   *           arrangement, same reverb, roughly a third of the nodes per note.
+   *  'low'  - one copy, no modulators, channels at priority 3 and under silenced, short mono
+   *           hall. Audibly a thinner arrangement, not just a cheaper one.
+   *  Switchable while playing. 'low' additionally wants to be set BEFORE init(), because the
+   *  reverb length and the shaper's oversampling are fixed when the context is built. */
+  quality(mode){
+    qLevel = mode === 'low' ? 0 : mode === 'mid' ? 1 : 2;
+    applyTier();
+    return this;
+  },
 
   /** Reverb on or off. */
   reverb(on){ setReverb(on); return this; },
@@ -11317,7 +11354,8 @@ return {
       suspicion, voices: liveCount,
       // Scheduler ticks that arrived more than 120 ms late, and the worst gap seen, since the
       // context was created. Both are diagnostics: nothing in the engine reads them.
-      late: lateHits, worstGap: worstGap,
+      late: lateHits, worstGap: worstGap, peakVoices: peakLive,
+      quality: ['low', 'mid', 'high'][qLevel],
       // What the device actually GAVE us, as opposed to what OUT_LATENCY asked for. `latencyHint`
       // is a request and the answer is the device's; this is the only way to find out what it
       // said. baseLatency is the graph's own buffering, outputLatency adds everything between the
