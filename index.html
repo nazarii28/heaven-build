@@ -690,13 +690,21 @@ const MUSIC_VOLUME = 0.75;        // handed to the engine on the first tap
 // on the canvas - 38 px square around an 11 px glyph. The consumable slots have to be kept clear
 // of it by hand; see SUPPLY_SLOT.right.
 const SOUND_BTN = { w: 11, h: 11 };
-// 'auto' | 'high' | 'low'. The phone answered the question this line used to leave open: on the
-// high tier the music tore and crackled, because the engine was asking a battery-powered chip for
-// a 4.6 s stereo convolution, a 2x-oversampled shaper and up to three hundred live nodes, into the
-// smallest output buffer the device would give it. 'auto' hands every touch device the low tier -
-// see detectAudioQuality() in 07_audio.js for what that decides and what it costs. The two fixed
-// values stay for A/B testing on a real device; the dev panel flips between them.
-const AUDIO_QUALITY = 'auto';
+// 'high' | 'low' | 'auto'. The phone crackles, and the first thing tried was 'auto': hand every
+// touch device the cheap tier. It worked and it cost too much - a shorter mono hall, one voice per
+// note instead of three, no vibrato, and 60 ms between a swipe and its stamp. The goal is a phone
+// that sounds like the desktop, so that trade is only worth making if it is the only one left.
+//
+// It probably is not. The same session found a fault that was costing far more than any of it: the
+// drums were generating their noise sample by sample on the main thread, inside the scheduler tick.
+// That is fixed, it is fixed on every device, and it changes nothing about how the game sounds. So
+// the tier goes back to 'high' and the phone is asked again with that one fault gone.
+//
+// If it still crackles, the ladder is: turn the reverb off (HALL in the dev panel - it is the most
+// expensive single node by a wide margin and the only one that can be dropped without touching a
+// note), then 'low', then 'auto'. All three paths are live and the dev panel flips the last two on
+// the device. See detectAudioQuality() in 07_audio.js for what 'auto' decides.
+const AUDIO_QUALITY = 'high';
 
 // The twenty-two cues also exist as one rendered file, and the engine can play either. 'synth' is
 // what ships: it costs nothing to load, cannot fail, and sounds the same on a phone that refused
@@ -10757,23 +10765,22 @@ function applyTier(){
   CAP_HARD = quality ? 300 : 170;
 }
 
-// The safety net under the guess. Device detection can only ever be a guess - a phone that reports
-// eight cores may be thermally throttled, a laptop may be running on a dying battery - so the
-// engine also watches whether it is in fact keeping up. A tick that arrives far later than the
-// 25 ms it asked for means the main thread was blocked; blocked long enough, often enough, and the
-// notes it should have been scheduling are already in the past. Twelve of those inside a few
-// seconds and the engine stops asking the device for a mix it cannot render.
+// Counts, and does nothing else. A tick arriving far later than the 25 ms it asked for means the
+// main thread was blocked, and blocked long enough the notes it should have been scheduling are
+// already in the past - so this number is the difference between "the audio thread cannot render
+// the mix" and "the main thread never gave it the notes", which sound identical and are fixed in
+// opposite places. The dev panel reads it on the device.
 //
-// One way only. Stepping back up would mean the mix thins and thickens as the game gets busy,
-// which is more distracting than the thin mix.
-let lateHits = 0, lateFrom = 0, lastTick = 0;
+// It used to act on what it counted, dropping the engine to the cheap tier after twelve late
+// ticks. That was removed rather than tuned: a mix that thins by itself when the game gets busy
+// is a worse thing to hear than either mix, and it makes every measurement ambiguous - you can no
+// longer tell whether what you are listening to is the build you shipped.
+let lateHits = 0, worstGap = 0, lastTick = 0;
 function watchLateness(now){
   if (lastTick) {
     const gap = now - lastTick;
-    if (gap > TICK_MS / 1000 + .12) {
-      if (now - lateFrom > 8) { lateHits = 0; lateFrom = now; }
-      if (++lateHits >= 12 && quality) { quality = 0; applyTier(); setReverb(false); }
-    }
+    if (gap > worstGap) worstGap = gap;
+    if (gap > TICK_MS / 1000 + .12) lateHits++;
   }
   lastTick = now;
 }
@@ -11279,6 +11286,9 @@ return {
       pos: posSec(), total: TOTAL_SEC,
       bar: running ? Math.floor(secToU(posSec()) / BAR_U) + 1 : 0,
       suspicion, voices: liveCount,
+      // Scheduler ticks that arrived more than 120 ms late, and the worst gap seen, since the
+      // context was created. Both are diagnostics: nothing in the engine reads them.
+      late: lateHits, worstGap: worstGap,
       buses: AC ? bus.map(b => b.gain.value) : [1, 0, 0],
       levels: Array.from(chLevel),
     };
