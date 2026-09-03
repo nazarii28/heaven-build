@@ -11378,6 +11378,1064 @@ function boot() {
 
 boot();
 
+// ==========================================================================
+// _cheats.js
+// ==========================================================================
+
+//@DEV-ONLY - never in a release build. Included only by `node tools/build.mjs --dev`, which is why
+// the filename starts with an underscore: the normal build skips those, and check.mjs fails on the
+// marker above if this file ever reaches dist/index.html.
+//
+// A playtest panel. It touches no game module: the buttons are plain DOM next to the canvas, and
+// the one hook it needs is taken by wrapping `frame` after boot, so nothing in src/*.js has to know
+// that any of this exists.
+
+const CHEAT_SPEEDS = [1, 2, 4];
+let cheatSpeed = 1;
+let cheatRealTime = 0;      // the last real timestamp the loop was handed
+let cheatFakeTime = 0;      // and the stretched one it thinks it is running on
+
+// --- The cheats ----------------------------------------------------------------
+
+// Real seconds of simulation, not seconds off the clock: contracts tick, production accrues,
+// arrivals arrive, Suspicion climbs. Rendering is skipped, so ten seconds land in a millisecond or
+// two - which is also why it is the honest way to skip time in a game made of timers.
+function cheatAdvance(seconds) {
+  const steps = Math.round(seconds / SIM_DT);
+  for (let i = 0; i < steps; i++) update(SIM_DT);
+}
+
+// Not `endDay()` directly: letting the clock run out means the settlement, the plate and the shop
+// all happen the way they do in a real day.
+function cheatEndDay() {
+  if (state.screen === SCREEN.DAY_ACTIVE) state.dayTime = 0.05;
+}
+
+function cheatExpireAll() {
+  for (const slot of state.heavenSlots) {
+    if (!slot.guest || slot.guest.expired) continue;
+    slot.guest.contract = 0;
+    slot.guest.expired = true;
+  }
+}
+
+// Straight to the night before a given day, with the tower as it stands. For the screenshot pass,
+// which has to reach day eight without playing seven of them: the settlement, the night card and
+// the shop all still happen, so the header it photographs is the header a player would see.
+function cheatJumpToDay(day) {
+  if (state.screen === SCREEN.DAY_ACTIVE) {
+    state.day = Math.max(1, day - 1);
+    state.aura = dayQuota(state.day);
+    state.dayTime = 0.05;
+    for (let i = 0; i < 200 && state.screen !== SCREEN.SHOP; i++) {
+      update(SIM_DT);
+      if (state.screen === SCREEN.NIGHT_CARD && state.night.in >= 1) {
+        if (state.night.choice < 0) answerPact(false); else openShop();
+      }
+    }
+  }
+}
+
+function cheatSpawnSoul() {
+  if (state.screen === SCREEN.DAY_ACTIVE) arriveSoul();
+}
+
+// All four shop tabs on the first night. The pages are gated by `state.day >= page.fromDay`, and
+// the honest way to reach the fourth one is to survive four days - which is four minutes of play
+// before anybody can look at the staff page at all.
+//
+// It moves the gate rather than the day. Setting `state.day` to 4 would open the tabs and also
+// change the quota, the arrival interval, the archetype weights and the number in the HUD, so what
+// the tester then looked at would be the wrong night. The dates in SHOP_PAGES are plain data on a
+// mutable object, so the panel keeps its one rule - it touches no game module, it edits the table
+// the game reads.
+//
+// Side effect worth knowing while testing onboarding: `newShopPage()` fires the tab beats for a
+// page whose `fromDay` equals tonight, so after this every page arrived on night one and the three
+// beats (tabSupplies, tabExtras, tabStaff) never speak again in this run.
+function cheatOpenShopPages() {
+  for (const page of SHOP_PAGES) page.fromDay = 1;
+  return 'TABS OPEN';
+}
+
+// Playtesting against an eight-minute loop on repeat is its own kind of punishment, and the
+// engine is unreachable from outside the build's IIFE, so the panel keeps a handle for the
+// screenshot harness as well.
+// Goes through the game's own toggle rather than the engine directly, so the HUD icon and the
+// panel button can never disagree about whether the build is muted.
+function cheatToggleMusic() {
+  toggleSound();
+  return soundEnabled() ? 'MUTE' : 'UNMUTE';
+}
+
+// The A/B for the sound pass. Both paths are in the shipped engine and both use the same cue
+// table, mode weights and ducking, so flipping this mid-run changes exactly one thing: whether a
+// cue is built out of oscillators or read out of the rendered bank.
+let cheatSfxBtn = null;     // the one button whose label can change without being pressed
+let cheatSfxWatch = null;
+
+// The label names what is playing NOW, not what pressing would do - so it is read off the engine
+// rather than composed from the request. (MUTE next to it means the opposite: it is the action,
+// not the state. The two have always disagreed; this one is the way round that suits a control
+// whose whole job is to answer "which of the two am I listening to?".)
+function cheatSfxLabel() {
+  const src = WTHAudio.sfxSource();
+  if (src !== 'sample') return 'SFX SYNTH';
+  // Asking for the bank before the decode has landed is allowed and leaves cues synthesised.
+  // Saying so is the difference between hearing no change and hearing no change for a reason.
+  const load = WTHAudio.bankState();
+  return load === 'ready' ? 'SFX OGG' : 'SFX OGG ' + load.toUpperCase();
+}
+
+function cheatToggleSfxSource() {
+  const want = WTHAudio.sfxSource() === 'sample' ? 'synth' : 'sample';
+  // A build shipped on 'synth' never fetches the file, so the first flip is what asks for it.
+  // The call is idempotent, so flipping back and forth costs one download.
+  if (want === 'sample') WTHAudio.bank(SFX_BANK);
+  WTHAudio.sfxSource(want);
+  // A label only redrawn on click would sit on LOADING until the next press, which is exactly
+  // the wrong moment to be wrong: the first press is the one that orders the file. So the decode
+  // gets watched to its end. Guarded against a second press starting a second watcher.
+  if (want === 'sample' && WTHAudio.bankState() === 'loading' && !cheatSfxWatch) {
+    cheatSfxWatch = setInterval(function () {
+      if (WTHAudio.bankState() === 'loading') return;
+      clearInterval(cheatSfxWatch); cheatSfxWatch = null;
+      // Not if the player flipped back to the synthesiser while it was decoding - then the label
+      // is already right and rewriting it would announce a source that is not playing.
+      if (cheatSfxBtn && WTHAudio.sfxSource() === 'sample') cheatSfxBtn.textContent = cheatSfxLabel();
+    }, 200);
+  }
+  return cheatSfxLabel();
+}
+
+// Two buttons for diagnosing a device that crackles, because "the music is broken" has three
+// different causes and they are told apart by which of these stops it. Reverb off and the tearing
+// goes away: the convolver was the cost. Quality low and it goes away: it was polyphony - too many
+// oscillators alive at once. Neither helps: the main thread is the problem, not the audio thread,
+// and the answer is in the renderer.
+//
+// The tier can only be moved this far at runtime. The length of the reverb impulse, whether the
+// shaper oversamples and how big an output buffer the device was asked for are all decided when
+// the context is built, on the first tap, and cannot be changed without tearing it down. So a
+// low-tier reading here is optimistic: a real low-tier device gets those three as well.
+let cheatQuality = 1;
+function cheatToggleQuality() {
+  cheatQuality = cheatQuality ? 0 : 1;
+  WTHAudio.quality(cheatQuality ? 'high' : 'low');
+  return cheatQuality ? 'AQ HIGH' : 'AQ LOW';
+}
+
+let cheatReverb = true;
+function cheatToggleReverb() {
+  cheatReverb = !cheatReverb;
+  WTHAudio.reverb(cheatReverb);
+  return cheatReverb ? 'HALL ON' : 'HALL OFF';
+}
+
+function cheatCycleSpeed() {
+  cheatSpeed = CHEAT_SPEEDS[(CHEAT_SPEEDS.indexOf(cheatSpeed) + 1) % CHEAT_SPEEDS.length];
+  return 'SPEED x' + cheatSpeed;
+}
+
+// --- The panel -----------------------------------------------------------------
+
+// A label returned from an action renames its own button, which is how the speed toggle reports
+// where it is.
+const CHEAT_BUTTONS = [
+  ['>> 10s',   () => cheatAdvance(10)],
+  ['>> 30s',   () => cheatAdvance(30)],
+  ['END DAY',  cheatEndDay],
+  ['SPEED x1', cheatCycleSpeed],
+  ['+500 CR',  () => { state.credits += 500; }],
+  ['+100 AU',  () => { state.aura += 100; }],
+  ['+10 SUS',  () => addSuspicion(10)],
+  ['-10 SUS',  () => addSuspicion(-10)],
+  ['EXPIRE',   cheatExpireAll],
+  ['+SOUL',    cheatSpawnSoul],
+  ['MUTE',     cheatToggleMusic],
+  [SFX_SOURCE === 'sample' ? 'SFX OGG' : 'SFX SYNTH', cheatToggleSfxSource],
+  ['AQ HIGH',  cheatToggleQuality],
+  ['HALL ON',  cheatToggleReverb],
+  ['+SLOT',    () => unlockNextSlot(state.heavenSlots)],
+  ['+DESK',    () => unlockNextSlot(state.cubicles)],
+  ['+TABS',    cheatOpenShopPages]
+];
+
+function cheatStyle(el, css) {
+  for (const k in css) el.style[k] = css[k];
+}
+
+function cheatButton(label, background, color) {
+  const b = document.createElement('button');
+  b.textContent = label;
+  cheatStyle(b, {
+    font: '10px monospace', padding: '3px 5px', cursor: 'pointer',
+    background: background, color: color, border: '1px solid #5a5f80'
+  });
+  return b;
+}
+
+function buildCheatPanel() {
+  const bar = document.createElement('div');
+  cheatStyle(bar, {
+    position: 'fixed', left: '0', bottom: '0', zIndex: '10',
+    display: 'flex', alignItems: 'flex-end', gap: '3px', padding: '3px',
+    background: 'rgba(16,14,24,0.85)', maxWidth: '52vw'
+  });
+
+  const body = document.createElement('div');
+  cheatStyle(body, { display: 'flex', flexWrap: 'wrap', gap: '2px' });
+  for (const [label, action] of CHEAT_BUTTONS) {
+    const b = cheatButton(label, '#2a2438', '#f2ead2');
+    if (action === cheatToggleSfxSource) cheatSfxBtn = b;
+    b.addEventListener('click', function () {
+      // Only a string renames the button - several of the actions return a boolean, and "true"
+      // is not a useful label for anything.
+      const renamed = action();
+      if (typeof renamed === 'string') b.textContent = renamed;
+      b.blur();                 // otherwise the next keypress goes to the button, not the page
+    });
+    body.appendChild(b);
+  }
+
+  // On a phone-sized window the panel covers the bottom of the game, so it starts folded there and
+  // open on a desktop window, where it lands in the letterbox beside the canvas.
+  if (window.innerWidth < 700) body.style.display = 'none';
+  const toggle = cheatButton('DEV', '#e0484b', '#100e18');
+  toggle.addEventListener('click', function () {
+    body.style.display = body.style.display === 'none' ? 'flex' : 'none';
+    toggle.blur();
+  });
+
+  bar.appendChild(toggle);
+  bar.appendChild(body);
+  document.body.appendChild(bar);
+}
+
+// --- Hook ----------------------------------------------------------------------
+
+// Speed is applied by stretching the timestamp the loop is handed rather than by running the
+// update twice per frame: the fixed-step accumulator then does the arithmetic it already does, and
+// the 100 ms delta clamp still protects a backgrounded tab. Above about x6 the clamp would win.
+// `frame` re-schedules itself by name, so the wrapper is what gets requested next time round.
+const cheatFrame = frame;
+frame = function (now) {
+  const dt = cheatRealTime ? now - cheatRealTime : 0;
+  cheatRealTime = now;
+  cheatFakeTime += dt * cheatSpeed;
+  cheatFrame(cheatFakeTime);
+};
+
+// Handles for the harnesses in tools/. Everything the game defines lives inside the IIFE in
+// index.template.html, so a script driving the page over the DevTools protocol can see exactly
+// what is hung on `window` here and nothing else - which is why `state.tutorial.hold` read as
+// `undefined` from outside and every check against it quietly passed.
+window.__audio = WTHAudio;
+window.__dev = {
+  state: state,
+  input: function (cx, cy) {
+    return { id: Input.pointerId, queued: Input.gestures.length, active: Input.drag.active,
+             vx: cx === undefined ? null : Math.round(toVirtualX(cx)),
+             vy: cy === undefined ? null : Math.round(toVirtualY(cy)),
+             rect: (function (r) { return { l: Math.round(r.left), t: Math.round(r.top),
+                                            w: Math.round(r.width), h: Math.round(r.height) }; })(canvas.getBoundingClientRect()),
+             slot0: (function (r) { return { x: r.x, y: r.y, w: r.w, h: r.h }; })(heavenSlotRect(0)) };
+  },
+
+  advance: cheatAdvance,
+  expireAll: cheatExpireAll,
+  openShopPages: cheatOpenShopPages,
+  spawnSoul: cheatSpawnSoul,
+  endDay: cheatEndDay,
+  jumpToDay: cheatJumpToDay,
+  // An onboarding beat that holds stops `advance` dead, because advance steps the real update and
+  // the real update is what the hold stops. A scripted skip has to tap it away the way a player
+  // would, so it gets the same call the gesture handler makes.
+  dismissBeat: tutorialDismiss,
+  // The two baked cloud canvases, so a shape on screen can be attributed to the layer that drew it
+  // rather than guessed at from the composite. Dev build only, like everything else on this handle.
+  cloudLayers: function () { return { back: cloudBack, front: cloudFront }; },
+  // The night contract's buttons move with the length of the text on the card, so the harness asks
+  // where they are rather than hard-coding a row that is right for one contract in eleven.
+  nightButtons: function () {
+    return [0, 1].map(function (i) {
+      const r = nightButtonRect(i);
+      return { x: Math.round(r.x + r.w / 2), y: Math.round(r.y + r.h / 2) };
+    });
+  }
+};
+
+cheatRealTime = performance.now();
+cheatFakeTime = cheatRealTime;
+buildCheatPanel();
+
+// ==========================================================================
+// _sim.js
+// ==========================================================================
+
+//@DEV-ONLY - never in a release build, see _cheats.js for how that is enforced.
+//
+// The balance harness (build step 9). It plays the real game with no renderer: a scripted player
+// makes the same calls the input layer makes, `update(SIM_DT)` is stepped by hand, and the run
+// reports what actually happened day by day. Nothing here models the economy - modelling it would
+// produce a second set of rules to keep in sync, and the whole point is to measure the first set.
+
+// A policy is a player. `reaction` is how long a card sits on the desk before it is decided, which
+// is the single most important number in here: decide instantly and the snap bonus is free and the
+// throughput is superhuman, so an honest run has to be slower than the machine can be.
+// The acceptance band from GDD 15: a balanced player is meant to live here rather than to park at
+// zero. Kept apart from SUSP_AMBER/SUSP_ALARM on purpose - those are what the game paints, this is
+// what the design is aiming for, and reading one off the other would hide a disagreement.
+const SIM_BAND_LO = 40;
+const SIM_BAND_HI = 60;
+
+const SIM_POLICIES = {
+  // Plays the tension the design intends: holy souls go upstairs and their doubts are paid for on
+  // the meter, souls that earn nothing there go to a desk, expired guests come down promptly, one
+  // desk is kept empty as a buffer, and capacity is bought before percentages.
+
+  balanced: {
+    reaction: 1.3,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.2,
+    deskBuffer: 2,
+    reliefAt: 45,
+    // Attractions join the list in wave C, and which ones a style takes is part of what the style
+    // IS: the balanced player buys the quiet ones and skips the pool, because the pool is popularity
+    // bought with the same meter that kills you.
+    shop: ['suite', 'cubicle', 'veranda', 'pie', 'lavender', 'poster', 'coffee', 'eula', 'wall', 'basket', 'lift'],
+    // Consumables are bought last, out of what is left after capacity - which is what a player who
+    // is planning rather than panicking does - and spent from inside the day (GDD 9.1).
+    supplies: ['choir', 'rush'],
+    coverAt: 58,
+    // One slot, one preference, and the wage comes out of the same Credits the capacity does.
+    staff: 'flow'
+  },
+  // Everything upstairs while there is room. Should run out of lounge, then out of meter.
+  aura: {
+    reaction: 1.1,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.2,
+    deskBuffer: 0,
+    auraOnly: true,
+    // Added in wave C: without it this style never buys relief at all, which stopped being a
+    // policy and started being a bot deficiency the moment Suspicion had a second source.
+    reliefAt: 55,
+    shop: ['suite', 'pool', 'pie', 'cubicle', 'wings', 'veranda', 'basket', 'poster', 'eula', 'lavender', 'lift'],
+    supplies: ['choir', 'terminate'],
+    coverAt: 62,
+    staff: 'experience'
+  },
+  // Basement first: build Credits and capacity early, and pay for it in Noise.
+  credits: {
+    reaction: 1.1,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.2,
+    deskBuffer: 0,
+    creditsFirst: 3,          // days spent filling desks before the lounge matters
+    shop: ['cubicle', 'lavender', 'coffee', 'poster', 'breakroom', 'suite', 'pie', 'eula', 'basket', 'lift'],
+    supplies: ['rush', 'choir'],
+    coverAt: 64,
+    staff: 'intern'
+  },
+  // Everybody gets a bed. A soul that is worthless upstairs and expensive there goes to a desk if
+  // there is one and upstairs if there is not - paying the Skepticism rather than the refusal - and
+  // the door is only used when both floors are genuinely full. This is the style a price on
+  // refusing-with-room is meant to reward, and it is measured alongside `balanced`.
+
+  placer: {
+    reaction: 1.3,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.2,
+    deskBuffer: 0,
+    placeAll: true,
+    reliefAt: 45,
+    shop: ['suite', 'cubicle', 'veranda', 'pie', 'lavender', 'poster', 'coffee', 'eula', 'wall', 'basket', 'lift'],
+    supplies: ['choir', 'rush'],
+    coverAt: 58,
+    staff: 'flow'
+  },
+  // --- Build probes (wave D) --------------------------------------------------
+  // These four are not controls, they are candidate BUILDS: each one is a way a competent player
+  // might try to win, and the question they answer is whether the balanced style is one viable
+  // route or the only one. A design that offers a shop of twenty-one things and one winning line
+  // through it is a shop with one item in it.
+
+  // Reported from live play: from day two, deny everything until a very gullible soul turns up,
+  // put that one upstairs, relocate it the moment the contract lapses, and keep buying relief.
+  // Transcribed as literally as the harness allows - it denies rather than filling desks, because
+  // that is what the player described doing.
+  //
+  // Since the flip this reads as the CHEAP filter rather than the rich one: a Gullibility 4 soul is
+  // now a soul that barely troubles the meter and barely earns. It is kept, unchanged, because it
+  // is the line that used to win 85% of runs and the only way to show the hole is closed is to
+  // measure the same player through the new rules.
+
+  cherry: {
+    reaction: 1.3,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.0,
+    deskBuffer: 0,
+    cherryFrom: 2,          // from this day nothing below cherryG is accepted at all
+    cherryG: 4,
+    reliefAt: 40,
+    shop: ['basket', 'suite', 'pie', 'cubicle', 'eula', 'lift', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'],
+    coverAt: 55,
+    staff: 'experience'
+  },
+  // The same idea at the pickiness a real player actually lands on. It matters more than the
+  // G >= 4 version: nobody has to find an optimum for this hole to open, and if a fix leaves this
+  // one dominant it has fixed nothing.
+
+  cherry3: {
+    reaction: 1.3,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.0,
+    deskBuffer: 0,
+    cherryFrom: 2,
+    cherryG: 3,
+    reliefAt: 40,
+    shop: ['basket', 'suite', 'pie', 'cubicle', 'eula', 'lift', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'],
+    coverAt: 55,
+    staff: 'experience'
+  },
+  // Stricter than the optimum: fewer souls clear the bar, so the lounge runs short.
+  cherry_g5f2: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.0, deskBuffer: 0,
+    cherryFrom: 2, cherryG: 5, reliefAt: 40,
+    shop: ['basket', 'suite', 'pie', 'cubicle', 'eula', 'lift', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'], coverAt: 55, staff: 'experience'
+  },
+  // The same threshold found two days later, which is when a player actually notices.
+  cherry_g4f4: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.0, deskBuffer: 0,
+    cherryFrom: 4, cherryG: 4, reliefAt: 40,
+    shop: ['basket', 'suite', 'pie', 'cubicle', 'eula', 'lift', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'], coverAt: 55, staff: 'experience'
+  },
+  // And found very late, as a last-ditch change of plan.
+  cherry_g4f6: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.0, deskBuffer: 0,
+    cherryFrom: 6, cherryG: 4, reliefAt: 40,
+    shop: ['basket', 'suite', 'pie', 'cubicle', 'eula', 'lift', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'], coverAt: 55, staff: 'experience'
+  },
+  // The balanced style with one rule changed: a suite is never spent on a soul that earns nothing
+  // in it. Below the bar the soul goes to a desk, and upstairs only if there is no desk at all.
+  // This exists to answer a question the sweep cannot otherwise separate - whether the saint filter
+  // wins because the GAME rewards refusing, or merely because `balanced` plays a bad hand well.
+  keeper: {
+    reaction: 1.3,
+    pacts: true,
+    service: true,
+    relocate: 1.2,
+    deskBuffer: 0,
+    minS: 2,
+    reliefAt: 45,
+    shop: ['suite', 'cubicle', 'veranda', 'pie', 'lavender', 'poster', 'coffee', 'eula', 'wall', 'basket', 'lift'],
+    supplies: ['choir', 'rush'],
+    coverAt: 58,
+    staff: 'flow'
+  },
+
+  // --- The exploit on the NEW axis (the flip) ---------------------------------
+
+  // The old cherry probes filter for Gullibility, which since the flip is the CHEAP end. If the
+  // flip has moved the hole rather than closed it, the winning filter is now the other one: take
+  // only the saints, earn three times what anybody else earns per suite, and pay for it on the
+  // meter. Measuring the change with only the old probes is how a balance pass talks itself into
+  // success, so these are here from the first sweep and not added after a disappointing one.
+  saint: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.0, deskBuffer: 0,
+    cherryFrom: 2, cherryS: 4, reliefAt: 40,
+    shop: ['basket', 'suite', 'pie', 'cubicle', 'eula', 'lift', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'], coverAt: 55, staff: 'experience'
+  },
+  // The pickiness a real player would actually land on, and the one that matters: nobody has to
+  // find an optimum for this hole to open.
+  saint3: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.0, deskBuffer: 0,
+    cherryFrom: 2, cherryS: 3, reliefAt: 40,
+    shop: ['basket', 'suite', 'pie', 'cubicle', 'eula', 'lift', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'], coverAt: 55, staff: 'experience'
+  },
+  // The same filter found two days later, which is when a player actually notices, and with the
+  // auditor on the payroll because this line's whole problem is the meter.
+  saint_s3f4: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.0, deskBuffer: 0,
+    cherryFrom: 4, cherryS: 3, reliefAt: 40,
+    shop: ['basket', 'suite', 'pie', 'cubicle', 'eula', 'lift', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'], coverAt: 55, staff: 'auditor'
+  },
+
+  // --- The exploit the desk rate could open (2 September) ----------------------
+
+  // Credits now read Gullibility, so there is a new line to try: sort every soul onto the floor
+  // that reads its better stat and refuse whatever reads low on both. It is the sharpest possible
+  // reading of the change, and it is here from the first sweep of it rather than added after a
+  // comfortable one - session 37 wrote that rule down after the concierge was measured only against
+  // the probes that flattered it.
+  sorter: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.2, deskBuffer: 0,
+    sortFrom: 2, sortS: 2, sortG: 3, reliefAt: 45,
+    shop: ['suite', 'cubicle', 'veranda', 'pie', 'lavender', 'poster', 'coffee', 'eula', 'basket', 'lift'],
+    supplies: ['choir', 'rush'], coverAt: 58, staff: 'flow'
+  },
+
+  // --- A/B pairs for the two rebuilt attractions (2 September) -----------------
+
+  // Both of these exist because the sweep cannot see either item from where it normally stands.
+  //
+  // The Motivational Wall widens the Snap Decision window, and every policy above reacts in 1.1 to
+  // 1.3 seconds against a 1.5 s window - they all snap everything already, so the item would have
+  // measured as exactly zero and the zero would have meant "the harness cannot see this", not "the
+  // item does nothing". `reader` is the player the item is FOR: two seconds on the docket, which is
+  // a real reading speed and is outside the window until the wall is bought. The pair differs by
+  // that one purchase and by nothing else.
+  reader: {
+    reaction: 2.0, pacts: true, service: true, relocate: 1.2, deskBuffer: 1, reliefAt: 45,
+    shop: ['suite', 'cubicle', 'veranda', 'pie', 'lavender', 'poster', 'coffee', 'eula', 'basket', 'lift'],
+    supplies: ['choir', 'rush'], coverAt: 58, staff: 'flow'
+  },
+  reader_wall: {
+    reaction: 2.0, pacts: true, service: true, relocate: 1.2, deskBuffer: 1, reliefAt: 45,
+    shop: ['wall', 'suite', 'cubicle', 'veranda', 'pie', 'lavender', 'poster', 'coffee', 'eula', 'basket', 'lift'],
+    supplies: ['choir', 'rush'], coverAt: 58, staff: 'flow'
+  },
+
+  // And the Orchestra of Found Wings pays lapsed guests for a price in Noise, so the style that can
+  // afford it is the one that bought the dampener - `balanced`, which takes all three Lavenders by
+  // day six. This is that style with the orchestra inserted after them and nothing else changed.
+  //
+  // Two earlier versions of this probe are worth remembering rather than deleting. The first bought
+  // the orchestra before its first suite, which is a purchase order nobody uses. The second was
+  // built on `throughput`, a style that dies of audits - and an attraction charged in raw Suspicion
+  // cost it four runs in 24 no matter which effect was on it, which is how the cost rather than the
+  // effect turned out to be the thing that was wrong.
+  // The control that every one of the probes above was missing: the same style with the POOL - an
+  // item nobody is questioning - inserted at exactly the position the orchestra occupies. Adding a
+  // sixth purchase to a shop list displaces the seventh, so a probe that only compares "with the
+  // new item" against "without it" is measuring the displacement and calling it the item.
+  balanced_pool: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.2, deskBuffer: 2, reliefAt: 45,
+    shop: ['suite', 'cubicle', 'veranda', 'pie', 'lavender', 'pool', 'poster', 'coffee', 'eula', 'wall', 'basket', 'lift'],
+    supplies: ['choir', 'rush'], coverAt: 58, staff: 'flow'
+  },
+  // SWAPPED for the wall, not inserted next to it, and that distinction is the whole method. The
+  // shop bot buys greedily in list order, so an inserted item delays every purchase after it: the
+  // orchestra at 70 landed on night three and pushed the Pie Diffuser and the first Lavender a full
+  // day back, which cost six runs in 24 and had nothing to do with what the item does - the same
+  // probe with the item's effect deleted lost exactly the same six. The Pool only ever measured as
+  // free because 110 keeps it out of the way until night six. One item in one slot against another
+  // item in the same slot is the only comparison on this page that means anything.
+  balanced_wings: {
+    reaction: 1.3, pacts: true, service: true, relocate: 1.2, deskBuffer: 2, reliefAt: 45,
+    shop: ['suite', 'cubicle', 'veranda', 'pie', 'lavender', 'poster', 'coffee', 'eula', 'wings', 'basket', 'lift'],
+    supplies: ['choir', 'rush'], coverAt: 58, staff: 'flow'
+  },
+
+  // Volume instead of selection: take anything that produces at all, buy the lift so expiries
+  // clear themselves, and let the lounge run hot.
+
+  throughput: {
+    reaction: 1.1,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.2,
+    deskBuffer: 0,
+    minS: 1,
+
+    reliefAt: 50,
+    shop: ['suite', 'lift', 'cubicle', 'eula', 'pie', 'basket', 'lavender', 'poster'],
+    supplies: ['choir', 'rush'],
+    coverAt: 58,
+    staff: 'flow'
+  },
+  // Popularity: buy the loud attractions, live on the arrival rate they buy, and pay for it with
+  // relief and an auditor on the payroll.
+  showman: {
+    reaction: 1.2,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.2,
+    deskBuffer: 1,
+    reliefAt: 48,
+    shop: ['veranda', 'suite', 'pool', 'cubicle', 'wings', 'basket', 'pie', 'eula', 'lavender'],
+    supplies: ['choir', 'rush'],
+    coverAt: 55,
+    staff: 'auditor'
+  },
+  // The basement done properly, as opposed to the `credits` control: no blind opening days, the
+  // same sorting rule as the balanced style, and a shop list that commits to Operations.
+  ops: {
+    reaction: 1.2,
+    pacts: true,
+    service: true,      // GDD 6.2 - every style that is keeping up would use it
+    relocate: 1.2,
+    deskBuffer: 0,
+    reliefAt: 45,
+    shop: ['cubicle', 'lavender', 'suite', 'poster', 'coffee', 'breakroom', 'pie', 'basket', 'eula', 'lift'],
+    supplies: ['rush', 'choir'],
+    coverAt: 58,
+    staff: 'auditor'
+  },
+  // A player who is not keeping up: slow decisions, slow to notice an expired contract.
+  sloppy: {
+    reaction: 2.6,
+    pacts: false,           // the player who does not read the night card and taps the safe answer
+    relocate: 3.5,
+    deskBuffer: 0,
+    reliefAt: 70,
+    shop: ['suite', 'cubicle', 'pie', 'lavender', 'poster', 'eula', 'basket', 'lift']
+  }
+};
+
+function simFreeHeaven() {
+  return firstFreeSlot(state.heavenSlots) >= 0;
+}
+
+function simFreeDesks() {
+  return freeSlotCount(state.cubicles);
+}
+
+// What a scripted player treats as worth a suite. Two pips of Sanctity is where the roster splits
+// into souls that pay for a lounge slot and souls that are only filling one: it takes in 37% of the
+// pool by weight, which is about what `g >= 3` took in before the flip, so the styles are as picky
+// as they were and the comparison across the change is honest.
+const SIM_WORTH_S = 2;
+
+// And what it treats as worth a DESK, which is a bar that could not exist before 2 September because
+// every soul paid the same rate there. Three pips of Gullibility is the soul that pays more at a
+// desk than the flat rate used to pay everybody (1.7/s against 1.5), so the bar is read off the
+// change itself rather than picked: below it a desk is worth less than it was worth yesterday.
+const SIM_WORTH_G = 3;
+
+// Where this soul goes. The rule the policies share: Skepticism is only charged upstairs, so a
+// doubter at a desk is free, and a soul with no Sanctity earns nothing in the lounge. Since the flip
+// those are usually NOT the same soul - the roster's holy are also its doubters - so a suite is a
+// trade rather than a filter, which is the whole reason the flip was made.
+function simDecide(p, soul) {
+  const desks = simFreeDesks();
+  const lounge = simFreeHeaven();
+  const useDesk = desks > (p.deskBuffer || 0);
+  const k = soulSkepticism(soul);
+
+  // The sorter: the lounge for Sanctity, a desk for Gullibility, the door for anything that reads
+  // low on both. Unlike the cherry lines it refuses on a pair of tests rather than one, so it is
+  // the style that most directly asks whether the new desk rate has made a filter out of the card.
+  if (p.sortFrom && state.day >= p.sortFrom) {
+    if (soul.s >= p.sortS && lounge) return 'up';
+    if (soul.g >= p.sortG && useDesk) return 'down';
+    if (soul.s >= p.sortS && useDesk) return 'down';
+    if (soul.g >= p.sortG && lounge) return 'up';
+    return 'left';
+  }
+  // Cherry-picking, on whichever axis the style believes in. `cherryS` keeps only the earners and
+  // pays the meter for them; `cherryG` keeps only the souls that are cheap on the meter and earns
+  // very little. Before the flip those two were the same filter, which is exactly the defect the
+  // flip removes: both are kept so the sweep measures both.
+  if (p.cherryFrom && state.day >= p.cherryFrom) {
+    const keep = p.cherryS ? soul.s >= p.cherryS : soul.g >= p.cherryG;
+    return (keep && lounge) ? 'up' : 'left';
+  }
+  // Never refuse anybody there is room for. A soul that earns nothing upstairs AND costs the meter
+  // there prefers a desk, but it goes upstairs rather than out of the door if there is no desk.
+  if (p.placeAll) {
+    if (soul.s < SIM_WORTH_S && k > SUSP_SKEPTIC_FREE) {
+      if (useDesk) return 'down';
+      if (lounge) return 'up';
+      return 'left';
+    }
+    if (lounge) return 'up';
+    if (useDesk) return 'down';
+    return 'left';
+  }
+  // A floor on what is worth a suite, without the deny-everything of the rule above: below it the
+  // soul still has somewhere useful to be.
+  if (p.minS && soul.s < p.minS) return useDesk ? 'down' : (lounge ? 'up' : 'left');
+
+  if (p.creditsFirst && state.day <= p.creditsFirst && desks > 0) return 'down';
+  // The earners go up first and are worth their pips on the meter. Everything below the bar is
+  // sorted by what it EARNS at a desk, which is the rule that changed on 2 September: the old line
+  // sent doubters down because Skepticism is only charged upstairs, and a doubter is now the soul
+  // that earns least downstairs. Reading the desk's own rate instead is not a new strategy, it is
+  // the same sentence - "put the soul where it is worth something" - applied to a floor that has a
+  // worth to read. A style left on the old rule would have been measured filling its desks with the
+  // cheapest workers in the building and reporting the change as a loss.
+  if (soul.s >= SIM_WORTH_S) return lounge ? 'up' : (useDesk ? 'down' : 'left');
+  if (p.auraOnly) return lounge ? 'up' : (desks > 0 ? 'down' : 'left');
+  if (soul.g >= SIM_WORTH_G) return useDesk ? 'down' : (lounge ? 'up' : 'left');
+  // Worth little in either place: a suite while it is cheap on the meter, a desk for the small
+  // money rather than the price of refusing with room to spare, and the door only when both are
+  // shut.
+  if (lounge && k <= SUSP_SKEPTIC_FREE) return 'up';
+  if (useDesk) return 'down';
+  if (lounge) return 'up';
+  return 'left';
+}
+
+
+// One tick of the player. Everything it calls is a function the real input layer calls too.
+//
+// A new screen has to be taught here in the same commit that adds it: this loop runs until WIN or
+// LOSE, and a screen it cannot leave does not crash the run - it rides quietly to
+// `outcome: 'timeout'`, so the numbers keep arriving and keep being wrong. The day-one hold (GDD 2)
+// is the same hazard in miniature: nothing advances until the first swipe, and the only reason this
+// scripted player still gets past it is that the held day keeps updating the card, so `card.age`
+// grows and the reaction below fires on its own.
+// The repair hold (GDD 6.5), modelled as what it costs rather than as what it pays: one thumb,
+// busy for SERVICE_HOLD seconds, during which nothing else on this screen happens. That is the
+// whole price of the mechanic, so a harness that gave the slot back without spending the seconds
+// would be measuring a different game - the card on the desk ages out of its snap bonus under a
+// hold, the queue keeps arriving, and an expiry downstairs waits.
+//
+// The change from the concierge is not in this code, it is in what `simRepairTarget` finds. The
+// concierge always had a target, so every style held constantly and the price was paid in a quiet
+// moment of the style's own choosing. A wreck only exists after this style has already lost a guest
+// to a riot, which is to say the harness now pays for the hold at the worst moment rather than the
+// best one - and that IS the mechanic, so the measurement is finally of the thing itself.
+//
+// A style takes a hold only when the desk is not asking for a decision, which is what a player who
+// is keeping up would do: the card must have SERVICE_HOLD left before it is due, so the hold
+// finishes before the soul does. A style that is drowning therefore repairs late, which is correct.
+function simRepairTarget() {
+  const count = visibleSlotCount(state.heavenSlots);
+  for (let i = 0; i < count; i++) {
+    if (state.heavenSlots[i].wrecked) return i;
+  }
+  return -1;
+}
+
+function simService(p, clock) {
+  if (!p.service) return false;
+  const card = state.card;
+  if (card && card.in >= 1 && card.age >= p.reaction - SERVICE_HOLD) return false;
+  const i = simRepairTarget();
+  if (i < 0) return false;
+  clock.busy = SERVICE_HOLD;
+  clock.serveSlot = i;
+  return true;
+}
+
+
+function simPlay(p, clock) {
+  if (state.screen === SCREEN.DAY_ACTIVE) {
+    // An onboarding beat that holds the day (GDD 8.4) stops the world until something taps it away,
+    // and this loop is the something. Without it the run does not crash - it rides quietly to
+    // `outcome: 'timeout'`, which is the failure mode the standing rule in GDD 13.0 is about.
+    if (tutorialHolding()) { tutorialDismiss(); return; }
+
+    // A hold in progress owns the thumb. It is checked before everything below, and the slot is
+    // re-tested on completion for the same reason the game re-tests it: what was under the finger
+    // when it came down need not still be there.
+    if (clock.busy > 0) {
+      clock.busy -= SIM_DT;
+      if (clock.busy > 0) return;
+      const slot = state.heavenSlots[clock.serveSlot];
+      if (slot && slot.wrecked) serveGuest(clock.serveSlot);
+      return;
+    }
+
+
+    const card = state.card;
+    if (card && card.in >= 1 && card.age >= p.reaction) {
+      handleCardSwipe(simDecide(p, card.soul));
+    }
+    simSupplies(p);
+    // One tap at a time, on a human cadence: a bot that relocates every expired guest in the same
+    // frame is not a player, it is the Express Elevator.
+    if (clock.relocateAt <= 0 && simFreeDesks() > 0) {
+      for (let i = 0; i < state.heavenSlots.length; i++) {
+        const guest = state.heavenSlots[i].guest;
+        if (guest && guest.expired) { relocateGuest(i); clock.relocateAt = p.relocate; return; }
+      }
+    }
+    // Last, because it is the only thing here a player would put down to do something else.
+    simService(p, clock);
+    return;
+  }
+
+  // The night contract (GDD 8.3), taught here in the same commit that adds it: a screen this loop
+  // cannot leave does not crash the run, it rides quietly to `outcome: 'timeout'` and keeps
+  // reporting numbers that are wrong. Three policies sign everything and one signs nothing, which
+  // is the pair of extremes the balance has to survive rather than an average of them.
+  if (state.screen === SCREEN.NIGHT_CARD && state.night.in >= 1) {
+    if (state.night.choice < 0) answerPact(!!p.pacts);
+    else openShop();
+    return;
+  }
+
+  if (state.screen === SCREEN.SHOP && state.shopIn >= 1) {
+    simShop(p);
+    startDay(state.day + 1);
+  }
+}
+
+// Spending a consumable, which is the only decision this game has that is taken DURING a day
+// (GDD 9.1). Three rules, in the order a player would think of them: cover the meter when it is
+// about to become the problem, rush the desks when there is an expiry with nowhere to go, and
+// terminate a suite when even that has not opened one.
+function simSupplies(p) {
+  if (supplyBusy()) return;
+  const stuck = expiredGuestCount() > 0 && simFreeDesks() === 0;
+  for (let i = 0; i < state.supplies.length; i++) {
+    const id = state.supplies[i];
+    if (!id) continue;
+    if (id === 'choir' && state.suspicion >= (p.coverAt || 58)) { useSupply(i); return; }
+    if (id === 'rush' && stuck) { useSupply(i); return; }
+    if (id === 'shuttle' && state.queue.length >= QUEUE_MAX - 1) { useSupply(i); return; }
+    if (id === 'terminate' && stuck) {
+      useSupply(i);
+      // The armed state needs the second gesture the player would make: pick the expired guest,
+      // which is the one the deadlock is about.
+      for (let k = 0; k < state.heavenSlots.length; k++) {
+        const guest = state.heavenSlots[k].guest;
+        if (guest && guest.expired) { terminateGuest(k); break; }
+      }
+      return;
+    }
+  }
+}
+
+// Buys down the priority list until nothing on it is affordable. Deliberately greedy rather than
+// clever: a policy that saves for two days is a different experiment, and this one is meant to
+// answer "is there anything worth buying at all on the day the shop opens".
+//
+// The one piece of judgement in here is the basket: a player watching the meter climb buys relief
+// before they buy growth, and a bot that never does makes the meter look unsurvivable when it is
+// merely expensive.
+function simShop(p) {
+  // The shift associate is hired before anything is bought, because the wage is the reason the
+  // credit line still has a decision in it on day seven and a bot that spends its last coin on a
+  // cubicle would never test that.
+  if (p.staff && !state.staff.hired && state.staff.offer.indexOf(p.staff) >= 0) {
+    const card = staffCard(p.staff);
+    if (card && state.credits >= card.wage * 2) hireStaff(p.staff);
+  }
+  let bought = true;
+  while (bought) {
+    bought = false;
+    const base = p.shop.concat(p.supplies || []);
+    const order = (p.reliefAt && state.suspicion >= p.reliefAt)
+      ? ['basket'].concat(base.filter(id => id !== 'basket'))
+      : base;
+    for (const id of order) {
+      const index = SHOP_ITEMS.findIndex(it => it.id === id);
+      const item = SHOP_ITEMS[index];
+      if (!item || itemMaxed(item) || itemIdle(item)) continue;
+      if (state.credits < itemPrice(item)) continue;
+      buyItem(index);
+      state.simPurchases.push(state.day + ':' + id);
+      bought = true;
+    }
+  }
+}
+
+// --- The run -------------------------------------------------------------------
+
+function simRun(policyName, seed, maxSeconds) {
+  const p = SIM_POLICIES[policyName];
+  resetGame();
+  rngState = (seed >>> 0) || 1;
+  state.simPurchases = [];
+  startDay(1);
+
+  const clock = { relocateAt: 0, busy: 0, serveSlot: -1 };
+  const days = [];
+  let reported = 0;
+  let before = simSnapshot();
+  const steps = Math.round((maxSeconds || 1200) / SIM_DT);
+
+  // Where the meter spends its time, not where it ends the day (GDD 15). The end-of-day value says
+  // nothing about whether the player lived in the band the art, the vignette and the hell layer of
+  // the soundtrack are written for; only seconds do. Counted over active play, so the shop and the
+  // end-of-day plate do not dilute it.
+  // `buzz` and `starved` join the band in wave C: the acceptance criteria are about where the
+  // meter lives, and after Buzz the answer to "why is it low" is either "the player is holding it
+  // down" or "the tower has nobody in it", which are opposite problems with the same reading.
+  const band = { active: 0, target: 0, amber: 0, alarm: 0, peak: 0, buzz: 0, starved: 0 };
+
+  for (let i = 0; i < steps; i++) {
+    simPlay(p, clock);
+    if (clock.relocateAt > 0) clock.relocateAt -= SIM_DT;
+    update(SIM_DT);
+
+    if (state.screen === SCREEN.DAY_ACTIVE && !state.dayHold) {
+      const v = state.suspicion;
+      band.active += SIM_DT;
+      if (v >= SIM_BAND_LO && v < SIM_BAND_HI) band.target += SIM_DT;
+      if (v >= SUSP_AMBER) band.amber += SIM_DT;
+      if (v >= SUSP_ALARM) band.alarm += SIM_DT;
+      if (v < SUSP_STARVE) band.starved += SIM_DT;
+      if (v > band.peak) band.peak = v;
+      band.buzz += state.buzz * SIM_DT;
+    }
+
+    // The settlement has already happened by the time the plate is up, so that is where a day is
+    // read off. The plate stands for a couple of seconds, hence the guard.
+    if (state.screen === SCREEN.DAY_END && reported < state.day) {
+      days.push(simDayReport(before));
+      reported = state.day;
+      before = simSnapshot();
+    }
+    if (state.screen === SCREEN.LOSE || state.screen === SCREEN.WIN) break;
+  }
+
+  // A run that ended in the middle of a day - an audit - still has that day worth reporting.
+  if (reported < state.day) days.push(simDayReport(before, true));
+
+  return {
+    policy: policyName,
+    seed: seed,
+    outcome: state.screen === SCREEN.WIN ? 'win'
+      : (state.screen === SCREEN.LOSE || state.screen === SCREEN.AUDIT ? 'lose:' + state.loseReason : 'timeout'),
+    lastDay: state.day,
+    band: {
+      active: Math.round(band.active),
+      target: band.active ? band.target / band.active : 0,
+      amber: band.active ? band.amber / band.active : 0,
+      alarm: band.active ? band.alarm / band.active : 0,
+      starved: band.active ? band.starved / band.active : 0,
+      buzz: band.active ? Math.round(band.buzz / band.active) : 0,
+      peak: Math.round(band.peak)
+    },
+    reputation: Math.round(state.reputation),
+    quotaMisses: state.quotaMisses,
+    verdict: runVerdict().title,
+    riots: state.stats.riots,
+    souls: state.stats.soulsProcessed,
+    denied: state.stats.denied,
+    turnedAway: state.stats.turnedAway,
+    completed: state.stats.completed,
+    repaired: state.stats.repaired,
+    wrecked: state.heavenSlots.filter(s => s.wrecked).length,
+
+    purchases: state.simPurchases.slice(),
+    days: days
+  };
+}
+
+function simSnapshot() {
+  return {
+    credits: state.credits,
+    riots: state.stats.riots,
+    souls: state.stats.soulsProcessed,
+    purchases: state.simPurchases.length
+  };
+}
+
+function simDayReport(before, unfinished) {
+  const r = state.dayResult;
+  return {
+    day: state.day,
+    quota: unfinished ? dayQuota(state.day) : r.quota,
+    aura: Math.round(unfinished ? state.aura : r.aura),
+    met: unfinished ? null : r.state,
+    credits: Math.round(state.credits),
+    earned: Math.round(state.credits - before.credits),
+    suspicion: Math.round(state.suspicion),
+    buzz: Math.round(state.buzz),
+    rep: Math.round(state.reputation),
+    riots: state.stats.riots - before.riots,
+    souls: state.stats.soulsProcessed - before.souls,
+    queue: state.queue.length,
+    bought: state.simPurchases.length - before.purchases,
+    slots: unlockedSlotCount(state.heavenSlots) + '/' + unlockedSlotCount(state.cubicles)
+  };
+}
+
+// --- Staging, for the screenshot harness --------------------------------------
+// Everything in the build lives inside one IIFE, so a screenshot tool driving the page over
+// DevTools cannot reach a single game function. Rather than open the whole scope to it, this is
+// one named door: put the game on a named screen with a stated amount of money and a stated number
+// of guests already placed, and let the tool photograph it. Dev-only, like the rest of this file.
+function simStage(opts) {
+  const o = opts || {};
+  resetGame();
+  rngState = (o.seed >>> 0) || 20260827;
+  startDay(o.day || 1);
+  state.dayHold = false;
+  if (o.credits != null) state.credits = o.credits;
+  if (o.suspicion != null) state.suspicion = o.suspicion;
+  if (o.reputation != null) state.reputation = o.reputation;
+  for (const id of (o.own || [])) state.upgrades[id] = (state.upgrades[id] || 0) + 1;
+  (o.supplies || []).forEach((id, i) => { if (i < SUPPLY_SLOTS) state.supplies[i] = id; });
+  for (let i = 0; i < (o.guests || 0); i++) {
+    const slot = firstFreeSlot(state.heavenSlots);
+    if (slot < 0) break;
+    placeGuest(state.heavenSlots, slot, makeSoul(state.day));
+  }
+  for (let i = 0; i < (o.desks || 0); i++) {
+    const slot = firstFreeSlot(state.cubicles);
+    if (slot < 0) break;
+    placeGuest(state.cubicles, slot, makeSoul(state.day));
+  }
+  // A staged screenshot is not a run: the onboarding beats would hold the day and cover the thing
+  // being photographed, and an effect that has to be shown running cannot be waited for.
+  // Wrecks are staged rather than caused, because causing one takes a full contract plus RIOT_DELAY
+  // and a screenshot tool cannot wait 86 seconds for a photograph.
+  // The slot is unlocked here as well as wrecked. `own: ['suite']` raises the upgrade LEVEL without
+  // running the purchase that unlocks a slot, so a staged wreck on an unbought suite would be
+  // invisible - which cost half an hour of looking for a missing chevron that was correctly absent.
+  for (const i of (o.wrecked || [])) {
+    const slot = state.heavenSlots[i];
+    if (slot) { slot.unlocked = true; slot.guest = null; slot.wrecked = true; }
+  }
+
+  if (o.quiet) { for (const id in TUTORIAL) state.tutorial.seen[id] = true; tutorialDismiss(); }
+
+  if (o.active) { state.supplies[0] = o.active; useSupply(0); }
+  if (o.hire) { hireStaff(o.hire); state.staff.note = o.note || ''; }
+  state.buzz = buzzTarget();
+  // The page is left where openShop() put it unless the caller names one: on the night a tab
+  // arrives the panel opens on that tab, and a screenshot that overrode it would photograph the
+  // one thing the staged unlock exists to prevent.
+  if (o.screen === 'shop') {
+    openShop();
+    state.shopIn = 1;
+    if (o.page !== undefined) state.shopPage = o.page;
+  }
+  else if (o.screen === 'night') { openNight(); state.night.in = 1; }
+  else { takeNextCard(); if (state.card) state.card.in = 1; }
+  return state.screen;
+}
+
+// The harness in tools/balance.mjs calls this over the DevTools protocol and formats the result.
+window.__sim = {
+  policies: Object.keys(SIM_POLICIES),
+  run: simRun,
+  stage: simStage,
+  // Three readouts the screenshot tooling needs from outside the bundle: where a suite is in CSS
+  // pixels, whether the slot is wrecked, and where the lounge strip has been scrolled to.
+
+  probe: function (i) {
+    const r = heavenSlotRect(i || 0);
+    const b = canvas.getBoundingClientRect();
+    return { x: b.left + (r.x + r.w / 2) * (b.width / VIEW_W),
+             y: b.top + (r.y + r.h / 2) * (b.height / Display.viewH) };
+  },
+  wrecked: function (i) { return !!state.heavenSlots[i].wrecked; },
+
+  scroll: function () { return Math.round(Strip.heaven.scroll); },
+
+
+  sweep: function (seeds, policies, maxSeconds) {
+    const out = [];
+    for (const name of (policies || Object.keys(SIM_POLICIES))) {
+      for (const seed of seeds) out.push(simRun(name, seed, maxSeconds));
+    }
+    return out;
+  }
+};
+
 })();
 </script>
 </body>
