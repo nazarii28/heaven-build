@@ -10435,6 +10435,14 @@ function distCurve(k){
   for (let i = 0; i < n; i++) { const x = i / n * 2 - 1; c[i] = (1 + k) * x / (1 + k * Math.abs(x)); }
   return c;
 }
+// Every shape the shaper will ever need, built once. k runs 1 to 4 across the Suspicion range; see
+// applySuspicion for why this is a table and not a function call.
+const DIST_STEPS = 16;
+let distTable = null, distIdx = -1;
+function buildDistTable(){
+  distTable = [];
+  for (let i = 0; i < DIST_STEPS; i++) distTable.push(distCurve(1 + (i / (DIST_STEPS - 1)) * 3));
+}
 function makeIR(sec, decay, damp, chans){
   const nch = chans || 2;
   const len = (AC.sampleRate * sec) | 0, b = AC.createBuffer(nch, len, AC.sampleRate);
@@ -10529,7 +10537,9 @@ function initAudio(){
   // '2x' oversampling doubles the sample rate through the shaper to keep the aliasing out of
   // the hell mix. It is a luxury: on the low tier the shaper runs at rate and the aliasing it
   // lets through lands in a bus that is already meant to sound damaged.
-  shaper.curve = distCurve(1); shaper.oversample = qLevel ? '2x' : 'none';
+  buildDistTable();
+  distIdx = 0; shaper.curve = distTable[0];
+  shaper.oversample = qLevel ? '2x' : 'none';
   shaper.connect(color);
 
   for (let tr = 0; tr < 3; tr++) {
@@ -10549,7 +10559,7 @@ function initAudio(){
       pan[tr].push(trio); dry[tr].push(dg); wet[tr].push(wg);
     }
   }
-  applySuspicion();
+  applySuspicion(true);
 }
 function ctx(){ initAudio(); if (AC.state === 'suspended') AC.resume(); return AC; }
 
@@ -10749,8 +10759,23 @@ function busWeights(v){
   const s = Math.max(1, (h + m + l) * .85);
   return [h / s, m / s, l / s];
 }
-function applySuspicion(){
+// The game calls this every simulation step - 60 times a second, for the length of a run - and
+// until it was measured on a phone nobody had asked what a call costs. Seven AudioParam events
+// crossing from the main thread to the audio thread, plus a freshly built 1024-point Float32Array
+// handed to a WaveShaper that sits in the always-on chain, which makes it rebuild its state and,
+// at '2x', its oversampling buffers with it. A quarter of a megabyte a second of garbage to say
+// the same thing sixty times over, to a mix that answers through a 0.9 s crossfade and cannot
+// express the difference between one frame and the next.
+//
+// So it does the work when the meter has actually moved. A quarter of a point is far under what a
+// 0.9 s fade can render, and the drip takes whole seconds to cross that. `force` is for the callers
+// that change something other than the meter - the reverb, a theme ending, the first build - and
+// have to be applied whatever the number says.
+let lastApplied = -1;
+function applySuspicion(force){
   if (!AC) return;
+  if (!force && Math.abs(suspicion - lastApplied) < .25) return;
+  lastApplied = suspicion;
   const t = AC.currentTime, w = busWeights(suspicion);
   for (let i = 0; i < 3; i++) {
     busTarget[i] = solo >= 0 ? (solo === i ? 1 : 0) : w[i];
@@ -10758,7 +10783,11 @@ function applySuspicion(){
     busWet[i].gain.setTargetAtTime(reverbOn ? busTarget[i] : 0, t, .9);
   }
   color.frequency.setTargetAtTime(11000 * Math.pow(2600 / 11000, suspicion / 100), t, .9);
-  shaper.curve = distCurve(1 + smoothstep(suspicion, 70, 100) * 3);
+  // Picked out of a table built at init rather than computed here. Sixteen steps across a
+  // distortion that takes thirty points of meter to arrive is finer than the ear follows, and the
+  // assignment only happens on a step change, so the shaper is left alone for seconds at a time.
+  const di = Math.round(smoothstep(suspicion, 70, 100) * (DIST_STEPS - 1));
+  if (di !== distIdx) { distIdx = di; shaper.curve = distTable[di]; }
 }
 function setSuspicion(v){ suspicion = clamp(v, 0, 100); applySuspicion(); }
 
@@ -10771,7 +10800,7 @@ function setReverb(on){
   reverbOn = !!on;
   if (!AC) return;
   if (reverbOn) for (let i = 0; i < 3; i++) busWet[i].connect(hall);
-  applySuspicion();
+  applySuspicion(true);
   clearTimeout(revTimer);
   if (!reverbOn) revTimer = setTimeout(function(){
     for (let i = 0; i < 3; i++) { try { busWet[i].disconnect(); } catch (e) {} }
@@ -10801,7 +10830,7 @@ let AHEAD = .25;
 const TICK_MS = 25;
 // live counts NODES, not notes: one voice is 2 to 5 nodes
 let CAP_SOFT = 200, CAP_HARD = 300;
-let running = false, startT = 0, timer = null;
+let running = false, startT = 0, timer = null, cullPrio = 0;
 const cur = [new Int32Array(16), new Int32Array(16), new Int32Array(16)];
 const chLevel = new Float32Array(16), chMute = new Uint8Array(16);
 let liveCount = 0;
@@ -10877,7 +10906,15 @@ function pump(){
 
 let dropped = 0;
 function emit(hU, now){
-  const minPrio = liveCount > CAP_HARD ? 8 : liveCount > CAP_SOFT ? 5 : 0;
+  // Two floors, and the higher wins. The cap-driven one reacts to how loaded the engine is right
+  // now; `cullPrio` is a flat floor set from outside and is the dial for finding out how much of
+  // the arrangement a given device can actually carry. It is a floor rather than a tier because
+  // the phone measurements kept moving two things at once and proving nothing about either.
+  //
+  // What the rungs silence, by PRIO: 4 takes texture and drone (both long sustained parts, so
+  // they hold nodes alive far longer than their note count suggests), 5 adds ostin, 6 adds arp
+  // and lowstr. Lead, choir, bass, drums and counter are never reachable this way.
+  const minPrio = Math.max(cullPrio, liveCount > CAP_HARD ? 8 : liveCount > CAP_SOFT ? 5 : 0);
   const lowQ = !qLevel;
   for (let tr = 0; tr < 3; tr++) {
     const audible = busTarget[tr] > .05;
@@ -10916,7 +10953,7 @@ function play(fromSec){
   if (running) { running = false; clearTimeout(timer); }
   if (themeId >= 0) { themeId = -1; clearTimeout(themeTimer); }
   killAll();
-  applySuspicion();
+  applySuspicion(true);
   const from = fromSec || 0;
   startT = AC.currentTime + .08 - from;
   resetCursors(secToU(from));
@@ -11270,7 +11307,7 @@ function pumpTheme(){
     }
     themeCur[ch] = i;
   }
-  if (now - themeStart > THEMES[themeId].sec + 5) { themeId = -1; applySuspicion(); return; }
+  if (now - themeStart > THEMES[themeId].sec + 5) { themeId = -1; applySuspicion(true); return; }
   themeTimer = setTimeout(pumpTheme, TICK_MS);
 }
 
@@ -11342,6 +11379,11 @@ return {
   /** Reverb on or off. */
   reverb(on){ setReverb(on); return this; },
 
+  /** Silence every channel below this priority, 0 to disable. A dial for finding how much of the
+   *  arrangement a device can carry, independent of the quality tier: the tier changes what a
+   *  note costs to build, this changes how many notes there are. See PRIO and `emit`. */
+  cull(n){ cullPrio = n | 0; return this; },
+
   /** Mute one role by channel number 0..15 (see ROLES). */
   mute(ch, on){ chMute[ch] = on ? 1 : 0; return this; },
 
@@ -11355,7 +11397,7 @@ return {
       // Scheduler ticks that arrived more than 120 ms late, and the worst gap seen, since the
       // context was created. Both are diagnostics: nothing in the engine reads them.
       late: lateHits, worstGap: worstGap, peakVoices: peakLive,
-      quality: ['low', 'mid', 'high'][qLevel],
+      quality: ['low', 'mid', 'high'][qLevel], cull: cullPrio, dropped: dropped,
       // What the device actually GAVE us, as opposed to what OUT_LATENCY asked for. `latencyHint`
       // is a request and the answer is the device's; this is the only way to find out what it
       // said. baseLatency is the graph's own buffering, outputLatency adds everything between the
@@ -11608,6 +11650,17 @@ function cheatToggleSfxSource() {
 // needed. Reads the engine for its starting label instead of assuming one, since 'auto' means the
 // device may already have chosen mid before this button is ever touched.
 const CHEAT_AQ = ['high', 'mid', 'low'];
+// The other half of the same question, and deliberately a separate button. The tier changes what a
+// NOTE costs to build; this changes how many notes there are. Every phone reading so far moved both
+// at once - 'low' does eight things, and one of them is silencing whole channels - so neither could
+// be credited. Rungs: 4 silences texture and drone, 5 adds ostin, 6 adds arp and lowstr.
+const CHEAT_CULL = [0, 4, 5, 6];
+function cheatCycleCull() {
+  const now = WTHAudio.state().cull;
+  const next = CHEAT_CULL[(CHEAT_CULL.indexOf(now) + 1) % CHEAT_CULL.length];
+  WTHAudio.cull(next);
+  return 'CULL ' + next;
+}
 function cheatCycleQuality() {
   const now = WTHAudio.state().quality;
   const next = CHEAT_AQ[(CHEAT_AQ.indexOf(now) + 1) % CHEAT_AQ.length];
@@ -11646,9 +11699,9 @@ function cheatToggleReverb() {
 // panel at load would be a guess - and the one thing a diagnostic must never do is guess.
 function cheatAudioStats() {
   const s = WTHAudio.state();
-  return 'Q' + s.quality.toUpperCase().slice(0, 1) +
+  return 'Q' + s.quality.toUpperCase().slice(0, 1) + ' C' + s.cull +
          ' L' + s.late + ' W' + Math.round(s.worstGap * 1000) +
-         ' V' + s.peakVoices +
+         ' V' + s.peakVoices + ' D' + s.dropped +
          ' B' + Math.round(s.baseLatency * s.sampleRate) +
          ' T' + Math.round((s.baseLatency + s.outputLatency) * 1000);
 }
@@ -11676,6 +11729,7 @@ const CHEAT_BUTTONS = [
   ['MUTE',     cheatToggleMusic],
   [SFX_SOURCE === 'sample' ? 'SFX OGG' : 'SFX SYNTH', cheatToggleSfxSource],
   ['AQ CYCLE', cheatCycleQuality],
+  ['CULL 0',   cheatCycleCull],
   ['HALL ON',  cheatToggleReverb],
   ['AUDIO?',   cheatAudioStats],
   ['+SLOT',    () => unlockNextSlot(state.heavenSlots)],
