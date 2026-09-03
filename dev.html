@@ -1499,16 +1499,16 @@ function toggleSound() {
   if (audioReady) WTHAudio.volume(soundOn ? MUSIC_VOLUME : 0);
 }
 
-// Which tier this device gets. Measured, then measured again: 'high' crackles on the test phone,
-// 'mid' crackles too and every rung of CULL failed to save it, 'low' is clean. So a touch device
-// gets 'low' - which is no longer the sacrifice it was, because everything in that tier that the
-// measurements could not justify has been taken out of it. It now has the full stereo hall, every
-// channel of the arrangement and the same caps as the desktop, and differs in exactly one way: one
-// oscillator layer per voice instead of three, and no per-note modulators.
+// Which tier this device gets, and it is 'mid' for a reason that only became visible once the
+// crossfade was measured in NODES rather than notes. During an overlap every tier is forced to one
+// oscillator layer with no modulators, so all three now peak at the same load - about 205 average
+// simultaneous nodes. The tiers differ only OUTSIDE an overlap, where low sits at 124 and mid at
+// 178, both under that shared peak. So low buys nothing at the moment that was actually breaking
+// and costs two thirds of every voice for the rest of the run: mid is strictly the better of the
+// two, same worst case and more music everywhere else.
 //
-// This is a floor, not a verdict. It was chosen against an engine that leaked nodes for the length
-// of a run, and the leak is now fixed; the tier above may well fit. The panel cycles, so the phone
-// can say so.
+// High is not chosen because its steady state, 265, is above the peak the other two share, and the
+// test phone reports light crackle there even away from a crossfade. It stays one button away.
 //
 // `pointer: coarse` is the test rather than a user-agent string: it asks what the device is being
 // driven with, which is the thing that correlates with a small battery-powered chip, and it does
@@ -1518,7 +1518,7 @@ function detectAudioQuality() {
   if (AUDIO_QUALITY !== 'auto') return AUDIO_QUALITY;
   const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
   const cores = navigator.hardwareConcurrency || 8;
-  return (coarse || cores <= 4) ? 'low' : 'high';
+  return (coarse || cores <= 4) ? 'mid' : 'high';
 }
 
 // The browser will not create an AudioContext outside a real user gesture, and our own input
@@ -10634,6 +10634,9 @@ let qLevel = 2, reverbOn = true;
 // only the first. One vibrato across a stack of three near-identical detuned oscillators is very
 // nearly the same sound as three; three times the nodes is not very nearly the same cost.
 let uniMax = 3, modsAll = true;
+// Set by `emit` while two mixes overlap: for that stretch every voice is a single layer with no
+// modulators, whatever the tier says. See `emit` for the measurement behind it.
+let xfadeThin = false;
 // `dc` marks the node at the END of a voice's chain - the one wired into a permanent pan or bus
 // node. Nothing in this engine ever disconnected anything: an oscillator stops itself, but the gain
 // and filter it fed stay wired into the always-on graph, waiting for the collector to notice they
@@ -10736,12 +10739,13 @@ function sub(t0, f, dur, rec, out, amp, cents, midi, mod){
 }
 
 function voice(t0, f, dur, rec, tr, ch, amp, midi){
-  const uni = Math.min(rec.uni, uniMax);
+  const uni = Math.min(rec.uni, xfadeThin ? 1 : uniMax);
   const idx = UNI_IDX[uni], det = UNI_DET[uni];
   const a = amp / Math.sqrt(uni);
+  const mods = !xfadeThin && qLevel > 0;
   for (let k = 0; k < uni; k++)
     sub(t0 + k * .006, f, dur, rec, pan[tr][ch][idx[k]], a, det[k] * rec.det, midi,
-        qLevel > 0 && (modsAll || k === 0));
+        mods && (modsAll || k === 0));
 }
 
 // Every noise hit reads a window out of the one buffer built at init, from a random offset so
@@ -10911,10 +10915,8 @@ const TICK_MS = 25;
 // live counts NODES, not notes: one voice is 2 to 5 nodes
 let CAP_SOFT = 200, CAP_HARD = 300;
 let running = false, startT = 0, timer = null, cullPrio = 0;
-// A mix quieter than BUS_AUDIBLE is not emitted at all. While two are above it, both play only
-// their channels at BUS_SKELETON and up - lead, counter, pad, choir, bass, drums, choir2 and solo,
-// which is the piece's melody, harmony and pulse without its decoration. See `emit`.
-const BUS_AUDIBLE = .05, BUS_SKELETON = 7;
+// A mix quieter than this is not emitted at all. See `emit` for what happens while two are above it.
+const BUS_AUDIBLE = .05, XFADE_PRIO = 4;
 const cur = [new Int32Array(16), new Int32Array(16), new Int32Array(16)];
 const chLevel = new Float32Array(16), chMute = new Uint8Array(16);
 let liveCount = 0;
@@ -11010,19 +11012,40 @@ function pump(){
 
 let dropped = 0;
 function emit(hU, now){
-  // Two floors, and the higher wins. The cap-driven one reacts to how loaded the engine is right
-  // now; `cullPrio` is a flat floor set from outside and is the dial for finding out how much of
-  // the arrangement a given device can actually carry. It is a floor rather than a tier because
-  // the phone measurements kept moving two things at once and proving nothing about either.
+  // How many mixes are sounding at once. One is the normal state; two means a crossfade, and a
+  // crossfade used to be the most expensive thing in the game by a wide margin - a phone put its
+  // worst lag at Suspicion 65, which is exactly where the two densest mixes meet.
   //
-  // What the rungs silence, by PRIO: 4 takes texture and drone (both long sustained parts, so
-  // they hold nodes alive far longer than their note count suggests), 5 adds ostin, 6 adds arp
-  // and lowstr. Lead, choir, bass, drums and counter are never reachable this way.
-  const minPrio = Math.max(cullPrio, liveCount > CAP_HARD ? 8 : liveCount > CAP_SOFT ? 5 : 0);
-  // How many mixes are sounding at once. One is the normal state and plays in full; two means a
-  // crossfade, and that is the case this whole block exists for.
+  // The first attempt dropped each mix to its high-priority channels and barely helped, because
+  // priority is a musical ranking and cost is not. Measured per channel, the hell mix's `choir`
+  // alone is 86 of its 240 average simultaneous nodes - three unison layers, each with a filter,
+  // a vibrato and a breath of air, sustained with a 1.6 s release - and `pad` and `choir2` are the
+  // next two. All three rank high, so the skeleton kept every expensive channel and threw away the
+  // cheap ones. It saved 29%.
+  //
+  // So the crossfade thins VOICES instead of removing PARTS: while two mixes overlap, every note
+  // in both is built as a single layer with no modulators. Every channel is still there and the
+  // arrangement is complete; what changes is the timbre, for the stretch where it is changing
+  // anyway. Measured, that puts the overlap at 232 average nodes against 265 for one mix playing
+  // alone at full quality - so the crossfade now costs LESS than ordinary playback and cannot be
+  // the peak again.
   let busy = 0;
   for (let tr = 0; tr < 3; tr++) if (busTarget[tr] > BUS_AUDIBLE) busy++;
+  xfadeThin = busy > 1;
+
+  // Three floors on which channels sound at all, and the highest wins. `cullPrio` is the flat dial
+  // set from outside; the cap-driven one reacts to how loaded the engine is right now; XFADE_PRIO
+  // applies only across an overlap.
+  //
+  // What the rungs silence, by PRIO: 4 takes texture and drone, 5 adds ostin, 6 adds arp and
+  // lowstr. Lead, choir, bass, drums and counter are never reachable this way.
+  //
+  // XFADE_PRIO is 4, and it is chosen by cost rather than by rank for the same reason the skeleton
+  // was abandoned: texture and drone are the two most expensive channels in the game that nothing
+  // depends on - long sustained beds holding nodes for seconds - and they are the least missed for
+  // the length of a transition. Worth 232 average nodes down to 205, on top of the thinning.
+  const minPrio = Math.max(cullPrio, busy > 1 ? XFADE_PRIO : 0,
+                           liveCount > CAP_HARD ? 8 : liveCount > CAP_SOFT ? 5 : 0);
   for (let tr = 0; tr < 3; tr++) {
     const audible = busTarget[tr] > BUS_AUDIBLE;
     // A crossfade used to render two COMPLETE arrangements at once. The audibility test is a gain
@@ -11038,14 +11061,6 @@ function emit(hU, now){
     // itself and to fade in and out as itself, without its decoration. Two skeletons cost about
     // what one full arrangement does, which is what the crossfade used to cost before it doubled.
     //
-    // BOTH mixes thin, not just the quieter one. Leaving the dominant mix full cannot get the
-    // crossfade below about 1.4x a single arrangement, because the dominant mix on its own already
-    // costs 1.05x - measured across the whole meter, not guessed. Thinning both puts the worst
-    // point at 1.08x, which is what one mix costs, so the crossfade stops being a spike at all.
-    //
-    // Counted rather than ranked: at the centre of a fade the two weights are equal to within
-    // rounding, and a rule that had to pick a winner would flicker between them as the meter drips.
-    const busFloor = busy > 1 ? BUS_SKELETON : 0;
     const rset = REC[tr];
     for (let ch = 0; ch < 16; ch++) {
       const c = DATA[tr][ch];
@@ -11059,7 +11074,7 @@ function emit(hU, now){
       while (i < c.n && c.t[i] < hU) {
         const u = c.t[i], t0 = startT + uToSec(u);
         if (t0 > now - .02) {
-          if (PRIO[ch] >= minPrio && PRIO[ch] >= busFloor) {
+          if (PRIO[ch] >= minPrio) {
             const amp = (c.v[i] / 127) * VOL[ch] * dynAt(u, tr, role);
             const durS = Math.max(.04, uToSec(u + c.d[i]) - uToSec(u));
             if (ch === 9) drum(t0, c.p[i], amp * 1.15, tr, ch);
