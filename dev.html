@@ -690,32 +690,54 @@ const MUSIC_VOLUME = 0.75;        // handed to the engine on the first tap
 // on the canvas - 38 px square around an 11 px glyph. The consumable slots have to be kept clear
 // of it by hand; see SUPPLY_SLOT.right.
 const SOUND_BTN = { w: 11, h: 11 };
-// 'auto' | 'high' | 'mid' | 'low'. Measured on a phone rather than guessed: 'high' crackles on it,
-// 'low' does not, and HALL OFF made no difference at either end. That last one is the informative
-// result - the reverb is the most expensive single node in the graph, so if removing it changes
-// nothing, the cost is not the fixed graph at all. It is what a note costs to build, and 'low' was
-// only fixing that by accident, alongside everything else it throws away.
-//
-// 'mid' was written for that measurement and did not survive it either - it crackled too, and no
-// rung of the CULL dial saved it, which ruled out note count as well. Only 'low' is clean on that
-// phone, so 'auto' gives touch devices 'low'.
-//
-// What makes that acceptable is that 'low' is no longer the sacrifice it was. Everything the tier
-// used to drag along that the measurements could not justify has been taken out of it: it has the
-// full stereo hall, every channel of the arrangement and the desktop's caps, and differs in one
-// way only - one oscillator layer per voice instead of three, and no per-note modulators.
-//
-// The choice was also made against an engine that leaked audio nodes for the length of a run,
-// which is now fixed, so the tier above may fit after all. See the qLevel comment in
-// 98_audio_engine.js for where the nodes go, and reg() for what was leaking.
-const AUDIO_QUALITY = 'auto';
+// Where the music and the cues come from. 'files' plays the six bundled .opus renders; 'synth'
+// runs the procedural engine in 98_audio_engine.js, which is what the build shipped with until
+// this pass and is now the fallback. The choice is not final at build time: a browser that cannot
+// decode Ogg Opus, or a page opened over file:// where a media element reaches the graph as
+// silence, falls back to the engine on its own. See pickAudioBackend() in 07_audio.js.
+const AUDIO_SOURCE = 'files';     // 'files' | 'synth'
 
-// The twenty-two cues also exist as one rendered file, and the engine can play either. 'synth' is
-// what ships: it costs nothing to load, cannot fail, and sounds the same on a phone that refused
-// the fetch as on one that took it. The file is here to be compared against - the dev panel flips
-// this at runtime - and to be the one-line change if the comparison ever goes the other way.
-const SFX_SOURCE = 'synth';       // 'synth' | 'sample'
-const SFX_BANK = 'audio/WTH_SFX.ogg';
+// One folder, six files, relative paths, no network. The three music renders share a timeline -
+// same length to the sample, same bars under them - which is the whole reason the Suspicion
+// crossfade survives the move out of the synthesiser unchanged: it was always a gain crossfade
+// between three arrangements, and three files can be crossfaded exactly as three buses were.
+const MUSIC_FILES = { heaven: 'audio/heaven.opus', middle: 'audio/middle.opus', hell: 'audio/hell.opus' };
+const THEME_FILES = { victory: 'audio/victory.opus', defeat: 'audio/defeat.opus' };
+const SFX_BANK    = 'audio/sfx.opus';
+
+// The three trims, and the only numbers here to turn if the balance is wrong by ear.
+//
+// Every one of the six files is mastered to -18 LUFS, so their relation to each other is the
+// composer's and not something this build should be second-guessing; these sit on top of that.
+// MUSIC_TRIM is the music bus, BANK_GAIN the cue bus, AUDIO_MASTER everything before the user's
+// own volume. BANK_GAIN's 0.60 is carried over rather than guessed: the previous bank played at
+// 0.38 and was 4 dB louder than this one, and 0.38 x 10^(4/20) is what keeps a stamp at the
+// loudness it has always had.
+const MUSIC_TRIM   = 1.0;
+const BANK_GAIN    = 0.60;
+const AUDIO_MASTER = 0.75;
+
+// How long CLOCK IN may be held shut waiting for the sound the run opens with, in seconds. The gate
+// exists because a cue is instant feedback on a tap and cannot arrive late, and because a day that
+// starts in silence and finds its music ten seconds later reads as a fault. The cap exists because
+// a game nobody can start is worse than a game that starts quiet. Measured against the load it is
+// waiting for: the bank is 1.7 MB and, fetched alone, lands in about thirteen seconds from a cold
+// page on a 1.6 Mbit link, with the stem half a second behind it. Twenty is past that with room,
+// and short enough that a stalled load is not a locked door.
+const AUDIO_GATE_MAX = 20;
+// What the cue bank weighs, for the loading bar and for nothing else. It is only reached when the
+// response has no Content-Length, which is not exotic - a chunked or compressed response has none,
+// and the local dev server had none until it was told to send one. Nothing functional reads this:
+// if the file is re-rendered at a different size the bar is a little wrong for a few seconds and
+// then finishes, because the end of the load is what sets it to full, not this number.
+const SFX_BANK_BYTES = 1730121;
+
+// 'auto' | 'high' | 'mid' | 'low'. Reaches the fallback engine only - nothing in the file player
+// is expensive enough to have tiers - and it is left as it was measured. 'high' crackled on the
+// test phone and 'low' did not, HALL OFF made no difference at either end, and no rung of the CULL
+// dial saved 'mid'. So 'auto' gives touch devices 'low'. See buildlog session 43; the whole reason
+// the music is files now is that this was as far as that road went.
+const AUDIO_QUALITY = 'auto';
 
 const AUDIT_TIME = 3;             // the beam and the collapse before the lose screen (GDD 11)
 
@@ -808,24 +830,33 @@ const STAFF_QUIT_SUSPICION = 12;  // an associate who was not paid leaves, and t
 // the cap is the two slots and nothing else has to enforce it.
 const SUPPLY_SLOTS = 2;
 const HUD_CREDITS_X = 92;         // was 118, moved left with the consumable slots (SUPPLY_SLOT)
-// Ten rows tall, and that is not a taste: the HUD at its shortest is four occupied bands - the day
-// row with the mute button in it, the resource row, the SUSPICION label with its number, and the
-// bar - and rows 55 to 64 of the 384 px view is the only gap between two of them that a box can
-// stand in without landing on a glyph. The width is free, because the right end of the resource
-// row is empty even at four digits of Credits.
+// Every number here is the largest the HUD row will give, because these were the smallest buttons
+// in the game and read as such on a phone. They were 18x10 at y 15 ending at x 176, and the whole
+// of that was caution rather than measurement.
 //
-// `right` is where the pair ENDS, and it is 176 rather than the edge of the HUD because of the mute
-// button. tapHit grows every target to HIT_MIN (38), so an 11 px button in the top right corner
+// Vertically the band is rows 13 to 24 of the 384 px view, and the box now fills it. The HUD at its
+// shortest is four occupied bands - the day row with the mute button in it, the resource row, the
+// SUSPICION label with its number, and the bar - and this is the one gap between two of them that a
+// box can stand in without landing on a glyph. The day row's glyphs end at row 12 and the SUSPICION
+// label starts at 25, so twelve rows is the whole of it and there is no thirteenth.
+//
+// `right` is where the pair ENDS, and it is bounded by the mute button rather than by the edge of
+// the HUD. tapHit grows every target to HIT_MIN (38), so an 11 px button in the top right corner
 // claims a 38 px box reaching from x 185.5 to well off the screen and from above the HUD down to
-// row 27 - and the second slot, drawn at 192..210 on row 15..25, sat ENTIRELY inside it. The mute
+// row 27 - and wave C first drew the second slot at 192..210, ENTIRELY inside that claim. The mute
 // toggle is answered before the screen is consulted, so that slot could not be tapped at all: not
-// awkward, unreachable. The comment beside SOUND_BTN said nothing was up there to collide with,
-// which was true when it was written and stopped being true when wave C put these here.
+// awkward, unreachable. The rule that came out of it, and that tools/check.mjs enforces, is about
+// the DRAWING and not about the grown boxes: no part of a slot's plate may fall inside the mute
+// button's hit box. 176 also kept the grown boxes apart, which nothing requires - where two grown
+// boxes meet the mute wins, and no drawing is harmed. 184 is the number the rule actually asks for,
+// and it buys eight pixels the pair had been leaving on the floor.
 //
-// 176 is the number that clears it: the right slot's own grown box then ends at 186, half a pixel
-// into the mute button's, which costs it half a pixel of overshoot and nothing of itself. Checked
-// by tools/check.mjs so it cannot drift back.
-const SUPPLY_SLOT = { w: 18, h: 10, gap: 3, y: 15, right: 176 };
+// Width is then whatever is left between that and the Credits readout, which check.mjs holds to a
+// five-digit ceiling no run reaches. 23 and 23 with 4 between them ends at 184 and starts at 134,
+// one clear pixel off that ceiling. What it buys is the pitch: two targets 21 px apart split a
+// 38 px box at the midpoint, which is 35 CSS px of aim on a 390 px phone and under any thumb
+// guideline going. At 27 it is 45.
+const SUPPLY_SLOT = { w: 23, h: 12, gap: 4, y: 13, right: 184 };
 // The banner sits at the top edge of the lounge, to the right of the queue row: the countdown has
 // to be where the consequences are, and the left half of that row is already the queue.
 const SUPPLY_BANNER = { x: 118, h: 15 };
@@ -886,6 +917,12 @@ const TUTORIAL_LIFE_LONG = 8;             // a beat that tells a story rather th
 // Cell is 7 px wide starting 0 px from the pen, 9 rows tall,
 // baseline on row 7. Format: KEY: [advance, ...9 row bitmasks], MSB = leftmost column.
 // Hand-drawn additions, not from m5x7: G ✦ ◈ ↑ ↓ ← →
+// The two currency marks sat one row high for the whole of the build: five rows drawn at rows 0-4,
+// centre row 2, while every other symbol in the table centres on row 3 - the digits and capitals
+// span 0-6, and +, =, the left and right arrows are five-row marks at 1-5. Next to a number, which
+// is where these two are always printed, that reads as the symbol floating over the line rather
+// than sitting on it. They are now at 1-5 like the arrows. The cell, the advance and the baseline
+// are untouched: the mark moved inside its own box, so no layout that measures text can notice.
 const FONT_W = 7, FONT_H = 9, FONT_X = 0, FONT_BASE = 7;
 const FONT = {
   "0": [6,56,68,68,68,68,68,56,0,0],
@@ -983,8 +1020,8 @@ const FONT = {
   "|": [2,64,64,64,64,64,64,64,0,0],
   "}": [4,96,32,32,48,32,32,32,96,0],
   "~": [6,0,0,32,124,8,0,0,0,0],
-  "✦": [6,16,56,124,56,16,0,0,0,0],
-  "◈": [6,16,40,84,40,16,0,0,0,0],
+  "✦": [6,0,16,56,124,56,16,0,0,0],
+  "◈": [6,0,16,40,84,40,16,0,0,0],
   "↑": [6,16,56,84,16,16,16,0,0,0],
   "↓": [6,16,16,16,84,56,16,0,0,0],
   "←": [6,0,16,32,124,32,16,0,0,0],
@@ -1060,6 +1097,23 @@ function drawText(ctx, text, x, y, color, px) {
     }
     cx += g[0] * px;
   }
+  return cx - x;
+}
+
+// One line, one colour, except for the characters named in `tint` - each of those is drawn in its
+// own. Written as runs rather than per character so a line of body text is still the same handful of
+// `drawText` calls it always was, and the advance is untouched: a tinted character is the same glyph
+// at the same width, so `wrapText` measured the line correctly before anything was coloured.
+function drawTextTinted(ctx, text, x, y, color, px, tint) {
+  let cx = x;
+  let run = '';
+  for (const ch of text) {
+    const c = tint[ch];
+    if (!c) { run += ch; continue; }
+    if (run) { cx += drawText(ctx, run, cx, y, color, px); run = ''; }
+    cx += drawText(ctx, ch, cx, y, c, px);
+  }
+  if (run) cx += drawText(ctx, run, cx, y, color, px);
   return cx - x;
 }
 
@@ -1504,10 +1558,14 @@ function tapHit(g, rect) {
 // ==========================================================================
 
 // The audio layer (GDD 1.5). The game speaks its own event names - `checkIn`, `refused`, `riot` -
-// and this file is the only place that knows they are cues in the engine (98_audio_engine.js).
-// That is why `sfx()` was written as a stub at step 1 and left alone for ten steps: every call
-// site was already in its final form, so switching the sound on is one translation table and no
-// edits to the game.
+// and this file is the only place that knows they are cues in a player. That is why `sfx()` was
+// written as a stub at step 1 and left alone for ten steps: every call site was already in its
+// final form, so switching the sound on is one translation table and no edits to the game.
+//
+// There are two players behind it now and the game cannot tell them apart. 97_audio_files.js plays
+// the six bundled .opus renders and is what ships; 98_audio_engine.js synthesises the same music
+// and cues from note data and is the fallback. `A` is whichever one answered, and everything below
+// this line calls through it.
 
 // The engine shipped fifteen cues to start with, and seven of our events had no cue that meant
 // them - `processed`, `expire`, `scroll`, `shop`, `suspicion`, `relief` and `lose`. They stayed
@@ -1548,12 +1606,13 @@ const SFX_MAP = {
 
 let audioReady = false;
 let audioTier = 0;          // which Suspicion thresholds have already announced themselves
+let A = null;               // the player that answered. Null until the first tap.
 
 // The mute toggle (GDD 1.5). Deliberately not part of `state`: PLAY AGAIN resets the run, not the
 // fact that the player is sitting in an open office. Nothing is persisted either - there is no
 // localStorage anywhere in this build, and a session is one sitting.
 //
-// It moves the engine's master gain, so effects go quiet with the music. Half a mute - a silent
+// It moves the player's master gain, so effects go quiet with the music. Half a mute - a silent
 // soundtrack still punctuated by stamps and riots - is not what anyone means by the button.
 let soundOn = true;
 
@@ -1561,23 +1620,11 @@ function soundEnabled() { return soundOn; }
 
 function toggleSound() {
   soundOn = !soundOn;
-  if (audioReady) WTHAudio.volume(soundOn ? MUSIC_VOLUME : 0);
+  if (A) A.volume(soundOn ? MUSIC_VOLUME : 0);
 }
 
-// 'low' on touch, and it is the measured answer rather than the cautious one. Mid was tried and
-// the test phone still crackles on it - lightly, on an empty lounge, and worse as the lounge fills.
-// Measured in average simultaneous nodes the two tiers are 178 and 124, and the device is evidently
-// somewhere between them.
-//
-// This is the floor after a long sequence of fixes on both sides of the problem: two real faults in
-// the audio engine (voices that were never disconnected, and a crossfade that rendered two complete
-// arrangements) and four in the renderer, each one recomputing something stable at the frequency of
-// the thing that drew it. Every one of those is fixed and low is still what this phone wants, so
-// the remaining cost is the synthesis itself rather than anything wasteful around it.
-//
-// Low is much less of a sacrifice than it was: it now has the full stereo hall, every channel of
-// the arrangement and the desktop's caps, and differs in one way only - one oscillator layer per
-// voice, and no per-note modulators. See buildlog Session 43 for what has and has not been tried. It stays one button away.
+// 'low' on touch, and it is the measured answer rather than the cautious one. Reaches the fallback
+// engine only: the file player has one media element per stem and no tiers to give it.
 //
 // `pointer: coarse` is the test rather than a user-agent string: it asks what the device is being
 // driven with, which is the thing that correlates with a small battery-powered chip, and it does
@@ -1590,29 +1637,101 @@ function detectAudioQuality() {
   return (coarse || cores <= 4) ? 'low' : 'high';
 }
 
+// Which player, and it is decided once, on the first tap, before either has been asked for
+// anything. `AUDIO_SOURCE` says what the build wants; `WTHFiles.supported()` says whether this
+// browser on this protocol can deliver it - see the comment on that function for the two cases
+// that say no, both of which are decided without fetching a byte.
+//
+// The answer can still be wrong, because a file can fail after it has been chosen. `onFail` is the
+// second chance: a stem that will not load, a bank that will not decode, or a graph that plays
+// perfectly and arrives silent hands the session back here and the engine takes over mid-run.
+// Nothing about that is graceful, and it is not meant to be - it is the difference between a judge
+// hearing a beat of nothing and a judge hearing nothing at all.
+function pickAudioBackend() {
+  if (AUDIO_SOURCE === 'files' && WTHFiles.supported()) {
+    WTHFiles.onFail(function () { switchToSynth(); });
+    return WTHFiles;
+  }
+  return startSynth();
+}
+
+function startSynth() {
+  // Before init(), not after. Most of what the tier does moves at runtime, but whether the
+  // distortion shaper oversamples is decided when the context is built and cannot be changed
+  // afterwards - so a tier chosen after that call would be a tier missing a piece.
+  WTHAudio.quality(detectAudioQuality());
+  WTHAudio.init();
+  return WTHAudio;
+}
+
+// Only ever runs once, because `onFail` only fires once. `wasPlaying` is read before the swap: a
+// failure on the title screen should leave the engine silent until CLOCK IN, and a failure in the
+// middle of day six should start the music.
+let audioSwitched = false;
+function switchToSynth() {
+  if (audioSwitched || A !== WTHFiles) return;
+  audioSwitched = true;
+  const wasPlaying = WTHFiles.state().playing;
+  WTHFiles.stop(0.2);
+  A = startSynth();
+  A.volume(soundOn ? MUSIC_VOLUME : 0);
+  A.setSuspicion(state.suspicion || 0);
+  if (wasPlaying) A.play();
+}
+
+// Called from boot, before anything has been tapped and before a backend has been chosen. It only
+// starts downloads: no AudioContext, no sound, and nothing here decides anything, so a build that
+// later falls back to the engine has wasted a fetch and no more.
+//
+// Worth the call because of what the alternative sounded like. Every one of these files used to
+// begin arriving on the tap that starts day one - the same tap that plays the day's first cue and
+// starts the music - so the first cue was silent and the music came in late, on every run, over
+// any connection slower than a local disk. A title screen is somebody reading a button, and this
+// is what that time is for.
+let audioBootAt = 0;
+function preloadAudio() {
+  audioBootAt = performance.now();
+  if (usingFiles()) WTHFiles.preload(SFX_BANK);
+}
+
+function usingFiles() { return AUDIO_SOURCE === 'files' && WTHFiles.supported(); }
+
+// Whether CLOCK IN should still be shut. What is waited for is decided in WTHFiles.loadProgress:
+// the cue bank, and the heaven stem's own promise that it will play through. A run therefore never
+// starts before the sound it opens with. The other two stems are minutes away and are not waited
+// for, and a load that has failed opens the gate at once rather than holding it to the timeout.
+function audioGated() {
+  if (!usingFiles() || audioSwitched) return false;
+  if (WTHFiles.loadProgress().ready) return false;
+  return (performance.now() - audioBootAt) / 1000 < AUDIO_GATE_MAX;
+}
+
+// 0..1, for the bar on the title screen.
+function audioLoadProgress() {
+  return usingFiles() ? WTHFiles.loadProgress().value : 1;
+}
+
 // The browser will not create an AudioContext outside a real user gesture, and our own input
 // layer is no help: it queues gestures and drains them inside the fixed-step update, which runs
 // from requestAnimationFrame. Chrome would forgive that - its activation flag is sticky for the
 // page - but iOS Safari wants the call inside the handler itself. So the unlock hangs off the raw
 // pointerdown in 06_input.js and off nothing else.
+//
+// The file player needs the same gesture twice over: once for the context, and once to bless five
+// media elements, because an element that has been played from a real tap may be started from
+// anywhere afterwards and one that has not may not be started at all. Both happen inside `init`.
 function unlockAudio() {
   if (audioReady) return;
   audioReady = true;
-  // Before init(), not after. Most of what the tier does now moves at runtime, but whether the
-  // distortion shaper oversamples is decided when the context is built and cannot be changed
-  // afterwards - so a tier chosen after this call would be a tier missing a piece.
-  WTHAudio.quality(detectAudioQuality());
-  WTHAudio.init();
-  // Muted before the context existed is still muted: the toggle can be pressed on the title screen,
-  // where the first tap creates the context and this runs immediately afterwards.
-  WTHAudio.volume(soundOn ? MUSIC_VOLUME : 0);
-  WTHAudio.sfxSource(SFX_SOURCE);
-  // Only fetched if it is going to be played. A build set to 'synth' never asks for the file at
-  // all, which is the point of that being the default: no download, no decode, and none of the
-  // tens of megabytes a three-minute stereo buffer occupies once it is resident. Asked for here
-  // rather than later because the decode needs a context, and this is the tap that made one.
-  // Nothing waits on it: cues stay synthesised until it lands, and if it never lands, for ever.
-  if (SFX_SOURCE === 'sample') WTHAudio.bank(SFX_BANK);
+  A = pickAudioBackend();
+  A.init();
+  // Muted before the context existed is still muted: the toggle can be pressed on the title
+  // screen, where the first tap creates the context and this runs immediately afterwards.
+  A.volume(soundOn ? MUSIC_VOLUME : 0);
+  // Asked for here rather than later because the decode needs a context, and this is the tap that
+  // made one. Nothing waits on it: cues are silent until it lands, which is a second or two of a
+  // title screen. A no-op on the engine, which has nothing to fetch.
+  A.bank(SFX_BANK);
 }
 
 // One continuous piece of music from the first day to the end of the run: the days, the end-of-day
@@ -1620,33 +1739,31 @@ function unlockAudio() {
 // themselves. Started from CLOCK IN, which happens once per run.
 function startMusic() {
   unlockAudio();
-  WTHAudio.play();
+  A.play();
 }
 
 function sfx(name) {
   if (!audioReady) return;
   const cue = SFX_MAP[name];
-  if (cue) WTHAudio.sfx(cue);
+  if (cue) A.sfx(cue);
 }
 
-// Called every simulation step, which is 60 times a second. That used to reach all the way into
-// the graph and cost seven AudioParam events and a rebuilt distortion curve each time; the engine
-// now drops a call whose meter has not moved a quarter of a point, so this stays a plain "tell it
-// whenever it changes" and the throttling lives where the cost is. The two tier crossings get a
-// sting on the way up only - going back down is relief, and relief that announces itself is just
-// another alarm.
+// Called every simulation step, which is 60 times a second. Both players drop a call whose meter
+// has not moved a quarter of a point, so this stays a plain "tell it whenever it changes" and the
+// throttling lives where the cost is. The two tier crossings get a sting on the way up only -
+// going back down is relief, and relief that announces itself is just another alarm.
 function audioSuspicion(v) {
   if (!audioReady) return;
-  WTHAudio.setSuspicion(v);
+  A.setSuspicion(v);
   const tier = v >= SUSP_ALARM ? 2 : (v >= SUSP_AMBER ? 1 : 0);
-  if (tier > audioTier) WTHAudio.sfx(tier === 2 ? 'susp75' : 'susp40');
+  if (tier > audioTier) A.sfx(tier === 2 ? 'susp75' : 'susp40');
   audioTier = tier;
 }
 
-// 'victory' or 'defeat'. Each stops the loop on its own, so there is nothing to stop here.
+// 'victory' or 'defeat'. Each takes the loop down under itself, so there is nothing to stop here.
 function audioTheme(which) {
   if (!audioReady) return;
-  WTHAudio.theme(which);
+  A.theme(which);
 }
 
 // PLAY AGAIN: the meter starts at zero again, so the crossings have to be allowed to fire again.
@@ -1654,6 +1771,10 @@ function audioTheme(which) {
 function resetAudio() {
   audioTier = 0;
 }
+
+// The dev panel talks to whichever player is running rather than to a named one, and needs to be
+// able to say which that is. Never called from the game.
+function audioBackend() { return A; }
 
 // ==========================================================================
 // 08_data.js
@@ -1869,13 +1990,20 @@ const TUTORIAL = {
   // been named. That quiet moment is the only one a day has, and spending it on "what am I looking
   // at" is what lets the first card be about the card.
   //
-  // Two floors, one joke, told twice. What the basement actually is - a bank of desks with a
-  // suspiciously similar sales pitch attached - is the whole premise, and it lands harder as the
-  // second half of a pair than it would as an explanation.
+  // The pair used to be one joke told twice - the second line repeated the first with the currency
+  // swapped, and the swap was the only thing in it the player did not already know. It reads well
+  // and it teaches nothing: the two floors differ in what happens to a guest once they are on them,
+  // and that difference is the reason the down swipe is a decision rather than an overflow.
+  //
+  // So the pair is now a contrast instead of an echo, and it turns on one word. Upstairs they STAY:
+  // the contract runs, and when it lapses the guest is still standing there, costing Suspicion
+  // until the player moves them. Downstairs NOBODY STAYS: the desk runs its own timer and clears
+  // itself. The joke survives in the first line, where it was always carried anyway - "as far as
+  // the guests know" is the whole premise and does not need a callback to land.
   floorHeaven: { hold: true, focus: 'floorHeaven',
-    text: 'Up here is the lounge. Heaven, as far as the guests know. It pays in ✦.' },
+    text: 'Up here is the lounge. Heaven, as far as the guests know. They stay, and pay ✦.' },
   floorOps:    { hold: true, focus: 'floorOps',
-    text: 'Down here is Operations. Also heaven, as far as the guests know. It pays in ◈.' },
+    text: 'Down here is Operations. Nobody stays. They sign, they file out, it pays ◈.' },
   firstCard: { hold: true,  text: 'Swipe up. Up is heaven. Up is also revenue.' },
   // The two numbers the whole game is played off, taught on the first docket and not before: the
   // card is on the desk, it is the only thing that has ever been on the desk, and the day is held
@@ -1906,6 +2034,20 @@ const TUTORIAL = {
   repair:    { hold: true, life: TUTORIAL_LIFE_LONG,
     text: 'That suite is out of service and Head Office can see it. Hold it to put it back.' },
   riot:      { hold: false, text: 'That is what an unhandled expiry sounds like. Upstairs can hear it.' },
+  // What "nobody stays" turns out to mean, paid off the first time a desk clears itself. The beat
+  // is deliberately not on day one with the floors: at the opening there is nothing downstairs and
+  // nothing has gone anywhere, so "further down" answers a question the player has not been given
+  // yet - and it would have to be paid for out of the same three lines that name the currency.
+  // A soul vanishing from a desk under a PROCESSED popup is where the question actually arrives,
+  // which is the rule every other beat in this table follows.
+  //
+  // It reports rather than asks, so it does not hold: the desk is already free and there is nothing
+  // for the player to do about it. The line names the word the popup just printed, which is what
+  // makes it read as an explanation instead of as trivia, and then declines to finish - the floor
+  // below Operations is the one thing in the building the game never shows, and an onboarding
+  // specialist who is not cleared for it is funnier and cheaper than anything that could be drawn.
+  processed: { hold: false, life: TUTORIAL_LIFE_LONG,
+    text: 'PROCESSED means they go one floor further down. I am not cleared to say more.' },
   // Wave C, and the only beat that teaches a rule the player cannot see happening (GDD 4.1): the
   // queue thinning out is the readout, and a thing that stops arriving is much harder to notice
   // than a thing that arrives.
@@ -4319,7 +4461,11 @@ function handleGesture(g) {
 
   switch (state.screen) {
     case SCREEN.TITLE:
-      if (tapHit(g, clockInButtonRect())) {
+      // The button is drawn as a progress bar while the cue bank is still arriving and a tap on it
+      // is swallowed rather than queued. The raw pointerdown behind this has already unlocked the
+      // audio (06_input.js), so tapping the shut button is not wasted - it is what creates the
+      // context the bank will be played through.
+      if (tapHit(g, clockInButtonRect()) && !audioGated()) {
         startMusic();
         sfx('start');
         startDay(1);
@@ -6922,8 +7068,9 @@ Object.assign(SHOP_ICON_SPRITES, ATTRACTION_ICON_SPRITES);
 //   SHOP, 20x20, full colour. Goes through drawShopIcon() like every other purchase, on a cell
 //   filled with `hudBg`. Same job as 15d and 15f.
 //
-//   HUD MARK, 10x8, ONE COLOUR. The slot is 18x10 and the icon lands at +4,+1, so 10x8 is the
-//   whole of the room. It is tinted at draw time - `ink` while the consumable can be spent,
+//   HUD MARK, 10x8, ONE COLOUR. It is centred in whatever the slot currently is - see
+//   drawSupplyIcon - and 10x8 is the size the smallest slot the HUD row allows can hold with a
+//   pixel to spare. It is tinted at draw time - `ink` while the consumable can be spent,
 //   `inkDim` while it cannot - and that tint is the only report of whether the slot is a button
 //   right now. So a mark is authored as a flat silhouette and drawn with drawSilhouette()
 //   (15_sprites.js), which already exists for the turn-away soul and caches one canvas per
@@ -7265,9 +7412,15 @@ Object.assign(SHOP_ICON_SPRITES, SUPPLY_ICON_SPRITES);
 
 // Replaces the primitive chain in 17_render_ui.js. Same signature, same call site: the slot still
 // decides the colour, which is the whole of the live/dead report.
-function drawSupplyIcon(ctx, id, x, y, color) {
+// Takes the slot rect and centres the mark in it, rather than a corner and a fixed inset. The box
+// has changed size once already, and +4,+1 was measured against the old one - it would have left
+// every mark two pixels above its middle without anything failing loudly enough to notice. The mark
+// reports its own size, so nothing here has to be told it.
+function drawSupplyIcon(ctx, id, r, color) {
   const mark = SUPPLY_MARK_SPRITES[id];
   if (!mark) return;
+  const x = r.x + Math.floor((r.w - mark.w) / 2);
+  const y = r.y + Math.floor((r.h - mark.h) / 2);
   drawSilhouette(ctx, mark, x, y, 0, color);
   // The strike is charged in Suspicion, so it is drawn in Suspicion whether or not the slot is
   // live. Dimming it with the rest would hide the price of the only consumable that has one.
@@ -8832,6 +8985,21 @@ function drawButton(ctx, r, label) {
   drawTextCentered(ctx, label, r.x + r.w / 2, r.y + Math.round((r.h - 7) / 2), C.bgDeep, 1);
 }
 
+// The same plate, filling left to right as the sound arrives. It is the button rather than a bar
+// somewhere else on purpose: the thing that is not ready is the thing being waited for, and putting
+// the wait anywhere else would leave a perfectly ordinary CLOCK IN sitting there not answering.
+//
+// The whole plate fills rather than a strip along its edge. The strip was tried first, to match the
+// pressed edge of the live button, and two pixels of it on a twenty-six pixel plate is not a thing
+// anyone reads as movement - which is the one job it has, since the difference between a wait and a
+// hang is entirely whether something is visibly happening. The label sits in the dark ink over
+// both halves, which it has the contrast for either way.
+function drawLoadingButton(ctx, r, p) {
+  fillRect(ctx, r.x, r.y, r.w, r.h, C.inkFaint);
+  fillRect(ctx, r.x, r.y, Math.round(r.w * clamp(p, 0, 1)), r.h, C.ink);
+  drawTextCentered(ctx, 'LOADING', r.x + r.w / 2, r.y + Math.round((r.h - 7) / 2), C.bgDeep, 1);
+}
+
 // --- The sound toggle (GDD 1.5, 3) --------------------------------------------
 // Top right of the HUD, on every screen that has one, and hit-tested before any screen gets a
 // look at the gesture. It is not a feature so much as a debt: the loop starts on CLOCK IN at
@@ -8909,7 +9077,7 @@ function renderSupplySlots(ctx) {
     const live = state.screen === SCREEN.DAY_ACTIVE && !supplyBusy();
     fillRect(ctx, r.x, r.y, r.w, r.h, C.panel);
     strokeRect(ctx, r.x, r.y, r.w, r.h, live ? C.aura : C.inkFaint);
-    drawSupplyIcon(ctx, id, r.x + 4, r.y + 1, live ? C.ink : C.inkDim);
+    drawSupplyIcon(ctx, id, r, live ? C.ink : C.inkDim);
   }
 }
 
@@ -9069,7 +9237,8 @@ function renderTitle(ctx) {
 
   drawTextCentered(ctx, TAGLINE, cx, top + 36, C.inkFaint, 1);
 
-  drawButton(ctx, clockInButtonRect(), 'CLOCK IN');
+  if (audioGated()) drawLoadingButton(ctx, clockInButtonRect(), audioLoadProgress());
+  else drawButton(ctx, clockInButtonRect(), 'CLOCK IN');
 
   // Day one's memo and feed are on the title screen, because day one has no night before it. Same
   // two lines, same order, so the header the player meets here is the header they meet every night.
@@ -10221,6 +10390,17 @@ function tutorialCheck() {
     if (slot.wrecked) { tutorialSay('repair'); break; }
   }
 
+  // The floor below Operations, paid off the first time a desk clears itself (GDD 8.4). Asked of
+  // the counter rather than fired from `dischargeGuest`, the way `riot` is fired from `riot()`:
+  // a discharge is an event too, but it is also what firing an associate does to their desk, and
+  // that one happens on the night panel where a day beat has no plate to be drawn on. Reading the
+  // counter from inside the day keeps the beat on the screen it is about.
+  //
+  // Last of the day beats, and deliberately behind the expiry and the wreck: it is the only beat
+  // in the game that is flavour rather than instruction, and it must never sit in front of an
+  // emergency in the queue. The desk it is about is empty either way.
+  if (state.stats.processed > 0) tutorialSay('processed');
+
 
   // The turn, and the last day (GDD 8, 8.4). Both are checked before the day-one beats below have
   // any chance of being true again, and both fire in the first frames of their day - the Associate
@@ -10312,6 +10492,18 @@ function drawSpeakerPortrait(ctx, x, y, frame) {
   drawSprite(ctx, SPR_ASSOCIATE_ONBOARDING, x, y, frame);
 }
 
+// The two currencies are five pixels of near-identical diamond at body size - ✦ is the filled one
+// and ◈ the hollow one - and every other place the game prints them tells them apart by colour:
+// the HUD counters, the worth line on the docket, the production popups floating off a guest. Body
+// text was the one place both came out in the same warm white, which is exactly where it hurts,
+// because the plate is where the player is told what each symbol means. Two beats name a currency
+// while pointing at the floor that pays it, and they were saying "it pays in a small shape" twice.
+//
+// Matched to the HUD readouts rather than picked: ✦ is `C.aura` because that is the colour of the
+// quota counter it is counted in, ◈ is `C.credits` for the same reason. The gold also lands on the
+// plate's own accent, which is not a clash - it is the credit colour agreeing with itself.
+const CURRENCY_INK = { '✦': C.aura, '◈': C.credits };
+
 // One plate, used by the day-one beats and by the last word on all three ending screens. Its height
 // is fixed at three lines whether it holds one or three, so a run of beats never makes the layout
 // jump - and the ending screens can reserve the space for it before they know which text they have.
@@ -10327,7 +10519,7 @@ function renderSpeakerPlate(ctx, y, text, accent, waiting, talkT) {
   drawText(ctx, SPEAKER_NAME, tx, y + 4, C.inkFaint, 1);
   const lines = wrapText(text, tw, 1);
   for (let i = 0; i < lines.length && i < SPEAKER_LINES; i++) {
-    drawText(ctx, lines[i], tx, y + 14 + i * 9, C.ink, 1);
+    drawTextTinted(ctx, lines[i], tx, y + 14 + i * 9, C.ink, 1, CURRENCY_INK);
   }
   // Only a beat that stopped the clock says this, and it says it inside the plate: the row below
   // the plate is the top of the lounge slots, where the halos are.
@@ -10405,6 +10597,820 @@ function renderTutorial(ctx, y) {
 }
 
 // ==========================================================================
+// 97_audio_files.js
+// ==========================================================================
+
+// ============================================================================
+// The file player (GDD 1.5). The soundtrack and the cues as bundled .opus renders, which is what
+// the build ships with now; 98_audio_engine.js is the same music synthesised, kept as the fallback
+// for the two cases a file cannot serve (see pickAudioBackend in 07_audio.js).
+//
+// It exposes the same names the engine does, so 07_audio.js can hold either one in a variable and
+// call it without asking which it is.
+//
+// WHY THE TRANSITION SURVIVES THE MOVE UNCHANGED. The Suspicion transition was never modulation.
+// It is a gain crossfade between three complete arrangements laid over one shared timeline, and
+// the three renders are that same timeline: 480.529 s each, and a cross-correlation of their
+// envelopes across the whole eight minutes puts the best lag at exactly zero for all three pairs.
+// So `busWeights` below is the engine's function copied without an edit, the ramp is the same
+// 0.9 s `setTargetAtTime`, and the tone sweep over the top is the same one filter. What plays is a
+// different recording; what the meter does to it is the same arithmetic.
+// ============================================================================
+
+const WTHFiles = (function () {
+'use strict';
+
+const smoothstep = (x, a, b) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+// The bank map, moved here whole from the engine. It belongs to the file and not to either player:
+// the numbers are cut points in sfx.opus, measured off the render, and the synthesised path has no
+// use for them. 22 cues x 3 modes, [start, length] per mode in heaven / middle / hell order.
+//
+// The re-master that levelled the six files to -18 LUFS did not move a single boundary - the new
+// bank correlates with the old one at r = 0.992 with zero lag - so this table came across as it
+// was, and the only thing that changed with it is BANK_GAIN.
+const BANK = {
+  checkin:    [  0.000,1.641,    1.761,1.592,    3.473,1.903],
+  reassign:   [  5.496,1.575,    7.191,1.533,    8.844,1.842],
+  deny:       [ 10.806,2.288,   13.214,2.224,   15.558,2.669],
+  scroll:     [ 18.347,0.351,   18.818,0.335,   19.273,0.392],
+  shop:       [ 19.785,1.642,   21.547,1.586,   23.253,1.883],
+  purchase:   [ 25.256,2.509,   27.885,2.438,   30.443,2.924],
+  nofunds:    [ 33.487,0.944,   34.551,0.915,   35.586,1.095],
+  soul:       [ 36.801,1.803,   38.724,1.739,   40.583,2.063],
+  expire:     [ 42.766,1.421,   44.307,1.372,   45.799,1.628],
+  processed:  [ 47.547,1.162,   48.829,1.124,   50.073,1.336],
+  snap:       [ 51.529,1.778,   53.427,1.714,   55.261,2.032],
+  quotaMet:   [ 57.413,3.292,   60.825,3.194,   64.139,3.819],
+  quotaFail:  [ 68.078,5.376,   73.574,5.249,   78.943,6.339],
+  dayStart:   [ 85.402,3.884,   89.406,3.771,   93.297,4.516],
+  elevator:   [ 97.933,3.059,  101.112,2.988,  104.220,3.612],
+  suspicion:  [107.952,0.954,  109.026,0.919,  110.065,1.087],
+  relief:     [111.272,2.325,  113.717,2.247,  116.084,2.673],
+  susp40:     [118.877,2.559,  121.556,2.488,  124.164,2.987],
+  susp75:     [127.271,4.534,  131.925,4.421,  136.466,5.329],
+  riot:       [141.915,5.534,  147.569,5.421,  153.110,6.579],
+  goodPerson: [159.809,5.584,  165.513,5.471,  171.104,6.641],
+  lose:       [177.865,3.768,  181.753,3.626,  185.499,4.286],
+};
+const BANK_FADE = .012;      // in and out, so a slice never starts or stops on a step
+
+const STEMS = ['heaven', 'middle', 'hell'];
+const BUS_AUDIBLE = .18;     // a mode below this weight is not worth a voice. Same figure as the engine.
+
+// The output buffer, in seconds, and the reasoning is the engine's: left to itself the API picks
+// 'interactive', which asks for the smallest buffer the device will give, and on Android that can
+// be 256 frames. 2048 frames is 43 ms, under what a hand reads as lag on a stamp, and the one
+// number hits it at both 48 kHz and 44.1 kHz. Kept even though the file player asks the audio
+// thread for a fraction of what the synthesiser did - the buffer costs nothing but delay, and the
+// cues are still scheduled against it.
+const OUT_LATENCY = 2048 / 48000;
+
+// How the three stems are kept together. They are three independent media elements and therefore
+// three independent clocks: they start in the same task and stay locked while nothing stalls, but
+// one decode underrun on a phone is a permanent offset, and an offset between two arrangements of
+// the same bars is a flam on every hit they share.
+//
+// So the leader is stem 0 and the other two are pulled to it. Under DRIFT_DEAD nothing happens -
+// `currentTime` on a media element is not reported finely enough for corrections that small to be
+// anything but noise. Between there and DRIFT_HARD the correction is a playbackRate nudge, capped
+// at DRIFT_RATE; 0.3 % is about five cents, which is inaudible on one layer of three and takes
+// under seven seconds to absorb the largest drift it is allowed to see. Past DRIFT_HARD the stem
+// is too far out to walk back and gets a seek, which is a click if it is audible - so an audible
+// stem is only ever seeked as a last resort, and a silent one is always seeked, because on a
+// stem nobody can hear a seek costs nothing.
+const DRIFT_MS   = 2000;     // how often the check runs
+const DRIFT_DEAD = .015;
+const DRIFT_HARD = .120;
+const DRIFT_RATE = .003;
+
+// How long the silence probe may wait for a mix worth judging, in 250 ms ticks. Two minutes.
+const SILENCE_CAP = 480;
+
+// The order the files are asked for, and it is the order the run needs them in rather than the
+// order they are listed in anywhere else. It exists because of a measurement: with all six started
+// at once, the browser gives the five media elements priority over the cue bank's `fetch`, and the
+// bank is the one asset that is useless until it is 100 % there. On a 4 Mbit link that put the
+// first sound effect of the run 18 seconds after CLOCK IN; at 1.6 Mbit, 43 seconds. Loaded alone
+// and first, it lands in a fraction of that, and the music - which streams, and needs only a lead -
+// follows behind it without anyone noticing.
+//
+// After the bank: heaven, because it is the only stem audible at Suspicion 0; then middle, which
+// the meter reaches within a day or two; then hell, which most runs reach late or not at all; then
+// the two endings, which cannot be needed before minute eight.
+const STAGES = [['heaven'], ['middle'], ['hell'], ['victory', 'defeat']];
+// How long a stage may hold the next one up. `canplaythrough` is the browser's own estimate and
+// some of them are slow to give it; this is the guarantee that a quiet estimate cannot stall the
+// chain behind it for ever.
+const STAGE_CAP = 8000;
+
+let AC = null;
+let master = null, userVol = null, sfxBus = null, themeGain = null;
+let color = null, musicDuck = null, musicOut = null;
+const stemEl = [], stemGain = [];
+const themeEl = {};
+let started = false;          // the elements have been created and blessed by a gesture
+let running = false;          // the loop is playing
+let themeName = null;
+
+let bankBuf = null;
+let bankLoad = 'idle';        // idle | loading | ready | failed
+let bankGot = 0, bankTotal = 0;
+let stageIdx = -1, stageTimer = null;
+let failed = false;
+let failCb = null;
+let failReason = null;
+
+// ---------------------------------------------------------------------------
+// 1. Whether this build can use files at all.
+// ---------------------------------------------------------------------------
+// Two ways it cannot, and both are decided before a single byte is fetched.
+//
+// The codec, because Ogg Opus is not universal: WebKit only gained it in Safari 18.4, so an older
+// iPhone can be handed these files and will play none of them.
+//
+// And the protocol, which is the one that would otherwise be found the hard way. A page opened by
+// double-clicking index.html runs on an opaque origin, and a media element loaded from there
+// reaches a MediaElementAudioSourceNode as silence rather than as an error - `fetch` for the bank
+// does not even get that far. The zip is meant to be served, and the verification ritual serves
+// it, but a judge who opens the file directly should get the synthesiser rather than nothing.
+function supported() {
+  if (typeof Audio === 'undefined') return false;
+  if (location.protocol === 'file:') return false;
+  const probe = new Audio();
+  return !!(probe.canPlayType && probe.canPlayType('audio/ogg; codecs=opus').replace('no', ''));
+}
+
+// One shot, and it is how the file path admits defeat after it has already been chosen: a stem
+// that will not load, a bank that will not decode, or a graph that turns out to be silent. The
+// callback in 07_audio.js tears this down and starts the engine in its place.
+function fail(why) {
+  if (failed) return;
+  failed = true;
+  failReason = why || 'unknown';
+  if (failCb) failCb(failReason);
+}
+
+// ---------------------------------------------------------------------------
+// 2. The graph.
+// ---------------------------------------------------------------------------
+//                        stemGain[0..2] -> color -> musicDuck -> musicOut -.
+//                                 themeGain --------------------------------+-> master -> userVol -> limiter
+//                                    sfxBus --------------------------------'
+//
+// Four gains where the engine had two, and each of them is moved by something different at a
+// different time: `musicDuck` by a cue, `musicOut` by the loop starting and stopping, `themeGain`
+// by an ending, `master` by nothing at all. Sharing one would mean a cancelScheduledValues meant
+// for a duck wiping a fade that was still running.
+//
+// What is NOT here is as deliberate as what is. No convolver: the renders were mixed with their
+// own space and a second hall on top is both wrong and, by the session 43 measurements, the most
+// expensive node the old graph had. No waveshaper on the hell stem: that shaped a synthesised bus
+// into something damaged, and the hell render already arrived that way. No master EQ curve: the
+// engine's -3 dB at 3.1 kHz and its high shelf were tuned against oscillators and would only dull
+// a finished master.
+function initAudio() {
+  if (AC) return;
+  const Ctor = window.AudioContext || window.webkitAudioContext;
+  try { AC = new Ctor({ latencyHint: OUT_LATENCY }); }
+  catch (e) { AC = new Ctor(); }        // Safari before 14 has no option bag
+
+  // Insurance, not a sound. Three files at -18 LUFS through these trims sit near -8 dBFS, so this
+  // should be asleep except where a cue lands on the loudest bar of the hell mix.
+  const limiter = AC.createDynamicsCompressor();
+  limiter.threshold.value = -4; limiter.knee.value = 14; limiter.ratio.value = 4;
+  limiter.attack.value = .006; limiter.release.value = .32;
+  limiter.connect(AC.destination);
+
+  userVol = AC.createGain(); userVol.gain.value = .7;
+  userVol.connect(limiter);
+
+  master = AC.createGain(); master.gain.value = AUDIO_MASTER;
+  master.connect(userVol);
+
+  sfxBus = AC.createGain(); sfxBus.gain.value = BANK_GAIN;
+  sfxBus.connect(master);
+
+  themeGain = AC.createGain(); themeGain.gain.value = 0;
+  themeGain.connect(master);
+
+  musicOut = AC.createGain(); musicOut.gain.value = .0001;
+  musicOut.connect(master);
+
+  musicDuck = AC.createGain(); musicDuck.gain.value = 1;
+  musicDuck.connect(musicOut);
+
+  // The one piece of modulation that survived, and the reason it did is that it is a mix move
+  // rather than a synthesis one: it works on any source. 11 kHz open at Suspicion 0 down to
+  // 2.6 kHz at 100, on the same 0.9 s ramp as the crossfade under it.
+  color = AC.createBiquadFilter();
+  color.type = 'lowpass'; color.frequency.value = 11000;
+  color.connect(musicDuck);
+
+  for (let i = 0; i < 3; i++) {
+    const g = AC.createGain();
+    g.gain.value = (i === 0 ? 1 : 0) * MUSIC_TRIM;
+    g.connect(color);
+    stemGain.push(g);
+  }
+}
+
+function ctx() { initAudio(); if (AC.state === 'suspended') AC.resume(); return AC; }
+
+// ---------------------------------------------------------------------------
+// 3. The elements.
+// ---------------------------------------------------------------------------
+// All five are created and played inside the gesture that creates the context, because a media
+// element is blessed by a real tap once and may then be started from anywhere. The two themes are
+// paused again a moment later - they exist at this point only so that a win eight minutes from now
+// can start one without asking the autoplay policy for permission it will not give.
+//
+// The three stems are left running from here to the end of the session. Pausing the silent ones
+// would save a little decoding and cost the thing the whole file player is built around: coming
+// back needs a seek, an Opus seek lands on a 20 ms frame boundary, and 20 ms against the two stems
+// still playing is exactly the flam this avoids. Three streaming Opus decoders is a rounding error
+// next to what the synthesiser was doing.
+function makeEl(loop) {
+  const el = new Audio();
+  el.loop = !!loop;
+  el.preload = 'auto';
+  // A drift correction is a resample, not a time-stretch. At 0.3 % the difference is academic, but
+  // stretching is the more expensive of the two and there is no reason to ask for it.
+  if ('preservesPitch' in el) el.preservesPitch = false;
+  else if ('mozPreservesPitch' in el) el.mozPreservesPitch = false;
+  else if ('webkitPreservesPitch' in el) el.webkitPreservesPitch = false;
+  el.addEventListener('error', function () { fail('load ' + (el.currentSrc || el.src || '?')); });
+  // A stem that has only just become playable has to be let into the mix, and the mix is only
+  // recomputed when the meter moves - which it may not do for a while. So readiness re-applies it.
+  el.addEventListener('canplay', function () { applySuspicion(true); });
+  return el;
+}
+
+// Everything exists from the start and nothing has a `src` yet, which is the whole trick: an
+// element with no source downloads nothing, and one that already exists can be wired into the
+// graph and blessed by the first tap whether or not its turn has come. Giving them their sources
+// later is what staggers the downloads without risking an element that the autoplay policy has
+// never seen a gesture for.
+const SRC_OF = {};
+function srcFor(name) {
+  return MUSIC_FILES[name] || THEME_FILES[name];
+}
+
+// A stem that is handed its source while the loop is already running must not start at zero: it
+// would be minutes out of step with the others and the watchdog would drag it back with seeks -
+// harmless, because the meter has not asked for it yet and nobody can hear it, but it reads in the
+// diagnostics as twelve seconds of drift and three seeks, which is a fault report for something
+// that is not a fault. Putting it where the leader is, the moment it knows its own length, is the
+// same result with nothing to explain.
+function syncNewStem(el) {
+  if (!running || stemEl.indexOf(el) < 1) return;
+  const go = function () { try { el.currentTime = stemEl[0].currentTime; } catch (e) {} };
+  if (el.readyState >= 1) go();
+  else el.addEventListener('loadedmetadata', go, { once: true });
+}
+
+function beginStage(i) {
+  clearTimeout(stageTimer);
+  stageIdx = i;
+  if (i >= STAGES.length) return;
+  const names = STAGES[i];
+  for (const name of names) {
+    const el = elByName[name];
+    if (!el || SRC_OF[name]) continue;
+    SRC_OF[name] = srcFor(name);
+    el.src = SRC_OF[name];
+    // Blessed here rather than at unlock when the tap came first, which is the usual order: the
+    // gate holds CLOCK IN until the bank has landed, and the bank landing is what starts this.
+    if (started) { el.play().catch(function () {}); syncNewStem(el); }
+  }
+  const lead = elByName[names[0]];
+  const done = function () { if (stageIdx === i) beginStage(i + 1); };
+  if (lead && lead.readyState >= 4) { done(); return; }
+  if (lead) lead.addEventListener('canplaythrough', done, { once: true });
+  stageTimer = setTimeout(done, STAGE_CAP);
+}
+
+// Creating the elements is the download, and it needs no context and no gesture, so it happens at
+// boot. That is the whole point of the split: before it, the fifteen megabytes of music and the
+// bank all started arriving on the tap that starts day one, and the first cue of the game - the
+// one CLOCK IN plays - was reliably silent because it fired while its own file was still in
+// flight. A title screen is several seconds of somebody reading a button, and this spends them.
+const elByName = {};
+function createElements() {
+  if (stemEl.length) return;
+  for (let i = 0; i < 3; i++) { const el = makeEl(true); stemEl.push(el); elByName[STEMS[i]] = el; }
+  for (const name of ['victory', 'defeat']) { const el = makeEl(false); themeEl[name] = el; elByName[name] = el; }
+}
+
+function startElements() {
+  if (started) return;
+  started = true;
+  createElements();
+  // Wired whether or not the file has been asked for yet - a source node on a sourceless element
+  // is silent and costs nothing, and doing it now means a stage that starts later has nothing left
+  // to arrange.
+  for (let i = 0; i < 3; i++) {
+    AC.createMediaElementSource(stemEl[i]).connect(stemGain[i]);
+    // Started here and not at CLOCK IN. It costs nothing while musicOut is at zero, and it means
+    // the decoders are warm and the heads are buffered by the time the loop is actually wanted.
+    if (SRC_OF[STEMS[i]]) stemEl[i].play().catch(function () {});
+  }
+  for (const name of ['victory', 'defeat']) {
+    const el = themeEl[name];
+    AC.createMediaElementSource(el).connect(themeGain);
+    // Play then pause: the play is the blessing, the pause is because nobody has won yet.
+    if (SRC_OF[name]) el.play().then(function () { el.pause(); el.currentTime = 0; })
+                               .catch(function () { try { el.pause(); } catch (e) {} });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. The Suspicion crossfade. The engine's, unedited.
+// ---------------------------------------------------------------------------
+let suspicion = 0, solo = -1;
+const busTarget = [1, 0, 0];
+// Heaven takes the first ~20 of the scale, hell everything from ~60. All the ground between them
+// is carried by the middle stem: it is what should be playing most of a run.
+function busWeights(v) {
+  const h = 1 - smoothstep(v, 10, 22);
+  const m = smoothstep(v, 8, 20) * (1 - smoothstep(v, 59, 74));
+  const l = smoothstep(v, 58, 72);
+  const s = Math.max(1, (h + m + l) * .85);
+  return [h / s, m / s, l / s];
+}
+
+// Called from the game sixty times a second, and doing the work only when the meter has actually
+// moved is the engine's rule kept for the engine's reason: a quarter of a point is far under what
+// a 0.9 s ramp can render, and the drip takes whole seconds to cross it. There is no distortion
+// table to rebuild here any more, but four AudioParam events a frame across the thread boundary
+// are still four more than the mix can express.
+let lastApplied = -1;
+function applySuspicion(force) {
+  if (!AC) return;
+  if (!force && Math.abs(suspicion - lastApplied) < .25) return;
+  lastApplied = suspicion;
+  const t = AC.currentTime, w = readyWeights(busWeights(suspicion));
+  for (let i = 0; i < 3; i++) {
+    busTarget[i] = solo >= 0 ? (solo === i ? 1 : 0) : w[i];
+    stemGain[i].gain.setTargetAtTime(busTarget[i] * MUSIC_TRIM, t, .9);
+  }
+  color.frequency.setTargetAtTime(11000 * Math.pow(2600 / 11000, suspicion / 100), t, .9);
+}
+// A stem that is still downloading cannot carry its share of the mix, and handing it that share
+// anyway is a hole in the music - at Suspicion 30 the whole weight is on middle, so a middle that
+// has not arrived is silence. Its share goes to whichever stems can play instead, which on the way
+// up means the previous arrangement simply stays put until its successor is there. When the
+// successor arrives its `canplay` re-applies this and the ordinary 0.9 s crossfade takes over.
+//
+// If nothing at all can play - the first seconds of a slow connection - the weights are left alone
+// rather than zeroed, because zeroing them is the same silence with a fade on it.
+function readyWeights(w) {
+  let want = 0, have = 0;
+  for (let i = 0; i < 3; i++) { want += w[i]; if (stemEl[i] && stemEl[i].readyState >= 3) have += w[i]; }
+  if (have < .001) return w;
+  if (have >= want - .001) return w;
+  const k = want / have;
+  return [0, 1, 2].map(i => (stemEl[i] && stemEl[i].readyState >= 3 ? w[i] * k : 0));
+}
+
+function setSuspicion(v) { suspicion = clamp(v, 0, 100); applySuspicion(); }
+
+// ---------------------------------------------------------------------------
+// 5. Transport.
+// ---------------------------------------------------------------------------
+let driftTimer = null, silenceProbe = null;
+
+// Seeking three elements at once is the one moment in a session where they can end up on
+// different frames, so it waits for all three to report the seek before any of them is told to
+// play. The cap is there because a browser that has not buffered the head yet will not report
+// anything: four seconds late is a worse start than a start that is slightly out, and the drift
+// watchdog closes a slight one within a couple of ticks anyway.
+function seekAll(from, done) {
+  // Only the stems that have been handed a source. Staged loading means the other two may not have
+  // one yet at CLOCK IN, and waiting on a `seeked` that cannot fire is how the music came to start
+  // on the four-second cap every time instead of straight away. The ones that arrive later are put
+  // where the leader is by `syncNewStem`, which is the same job done at the right moment.
+  const wait = stemEl.filter(el => el.src);
+  let left = wait.length, fired = false;
+  const finish = function () { if (!fired) { fired = true; done(); } };
+  if (!left) { finish(); return; }
+  const cap = setTimeout(finish, 4000);
+  const one = function (el) {
+    const ok = function () { if (--left === 0) { clearTimeout(cap); finish(); } };
+    if (el.readyState < 1) {
+      el.addEventListener('loadedmetadata', function () { try { el.currentTime = from; } catch (e) {} }, { once: true });
+      el.addEventListener('seeked', ok, { once: true });
+      return;
+    }
+    if (Math.abs(el.currentTime - from) < .01) { ok(); return; }
+    el.addEventListener('seeked', ok, { once: true });
+    try { el.currentTime = from; } catch (e) { ok(); }
+  };
+  for (const el of wait) { el.pause(); one(el); }
+}
+
+function play(fromSec) {
+  ctx();
+  startElements();
+  stopTheme(.25);
+  // Clamped against the render rather than a constant, and a second short of its end so that a
+  // start point handed in by a harness cannot land inside the wrap.
+  const dur = stemEl.length && stemEl[0].duration ? stemEl[0].duration : 480;
+  const from = clamp(fromSec || 0, 0, Math.max(0, dur - 1));
+  driftWorst = 0; driftSeeks = 0;
+  running = true;
+  seekAll(from, function () {
+    if (!running) return;                       // a theme or a stop landed while the seek was out
+    for (const el of stemEl) if (el.src) { el.playbackRate = 1; el.play().catch(function () {}); }
+    const t = AC.currentTime;
+    musicOut.gain.cancelScheduledValues(t);
+    musicOut.gain.setValueAtTime(.0001, t);
+    musicOut.gain.linearRampToValueAtTime(1, t + .35);
+    startDrift();
+    armSilenceProbe();
+  });
+  applySuspicion(true);
+}
+
+function stop(fade) {
+  running = false;
+  if (!AC) return;
+  const f = fade === undefined ? .4 : fade, t = AC.currentTime;
+  musicOut.gain.cancelScheduledValues(t);
+  musicOut.gain.setValueAtTime(Math.max(.0001, musicOut.gain.value), t);
+  musicOut.gain.linearRampToValueAtTime(.0001, t + f);
+  stopDrift();
+  // Paused after the fade rather than with it: pausing a sounding element is a click, and the
+  // decoders are cheap enough that half a second of them running into silence is not worth
+  // guarding against.
+  setTimeout(function () { if (!running) for (const el of stemEl) el.pause(); }, (f + .1) * 1000);
+}
+
+function posSec() { return stemEl.length ? stemEl[0].currentTime : 0; }
+
+// ---------------------------------------------------------------------------
+// 5b. The drift watchdog. See DRIFT_* above for the thresholds and why they are those.
+// ---------------------------------------------------------------------------
+let driftWorst = 0, driftSeeks = 0;
+
+function startDrift() {
+  if (driftTimer) return;
+  driftTimer = setInterval(checkDrift, DRIFT_MS);
+}
+function stopDrift() {
+  clearInterval(driftTimer); driftTimer = null;
+  for (const el of stemEl) el.playbackRate = 1;
+}
+
+function checkDrift() {
+  if (!running || stemEl.length < 3 || stemEl[0].paused) return;
+  const dur = stemEl[0].duration;
+  const lead = stemEl[0].currentTime;
+  for (let i = 1; i < 3; i++) {
+    const el = stemEl[i];
+    if (!el.src || el.paused || !el.duration) continue;
+    // One stem can wrap a tick before another, which reads as eight minutes of drift rather than
+    // the few milliseconds it is. Folded into the half-loop either side of zero before it is
+    // judged, so a wrap costs nothing.
+    let d = el.currentTime - lead;
+    if (dur > 1) { while (d > dur / 2) d -= dur; while (d < -dur / 2) d += dur; }
+    const mag = Math.abs(d);
+    // Counted only while the meter is actually asking for this stem. A stem still downloading
+    // behind the one that is playing falls arbitrarily far behind and is put back with a free
+    // seek, and reporting that as drift would make an ordinary slow connection read like a fault
+    // in the crossfade. The number is meant to answer "are the arrangements anyone can hear still
+    // one piece of music", so that is what it measures.
+    const audible = busTarget[i] >= .02;
+    if (audible && mag > driftWorst) driftWorst = mag;
+    if (mag < DRIFT_DEAD) { el.playbackRate = 1; continue; }
+    if (mag > DRIFT_HARD || !audible) {
+      el.playbackRate = 1;
+      try { el.currentTime = lead; if (audible) driftSeeks++; } catch (e) {}
+      continue;
+    }
+    el.playbackRate = 1 - clamp(d / 4, -DRIFT_RATE, DRIFT_RATE);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5c. The silence probe.
+// ---------------------------------------------------------------------------
+// The one failure this path has that reports itself as success. A media element whose origin the
+// graph will not accept plays perfectly - `currentTime` advances, no error fires - and arrives at
+// the destination as zeroes. `supported()` rules out the case that causes it, and this catches
+// whatever else does the same thing.
+//
+// It reads the music bus ahead of the mute, so a player who muted before CLOCK IN is not mistaken
+// for a broken graph, and it runs once: it is looking for a graph that was never going to work,
+// not for a quiet bar.
+function armSilenceProbe() {
+  if (silenceProbe || failed) return;
+  const an = AC.createAnalyser();
+  an.fftSize = 512;
+  musicDuck.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  let peak = 0, sounded = 0, ticks = 0;
+  const stop = function () {
+    clearInterval(silenceProbe); silenceProbe = null;
+    try { musicDuck.disconnect(an); } catch (e) {}
+  };
+  silenceProbe = setInterval(function () {
+    // Only a tick where a stem the meter is asking for could actually be producing sound counts.
+    // Without that test the probe reads a slow connection as a broken graph: on a 400 kbit link
+    // the loading gate lets the player in before the music has arrived, the analyser sees exactly
+    // the zeroes it is looking for, and a build that was thirty seconds from playing perfectly
+    // gives up and hands the session to the synthesiser. It is looking for a graph that was never
+    // going to work, not for a file that has not landed yet.
+    let live = false;
+    for (let i = 0; i < 3; i++) {
+      const el = stemEl[i];
+      if (busTarget[i] >= .02 && el && el.src && el.readyState >= 3 && !el.paused) live = true;
+    }
+    if (live) {
+      an.getFloatTimeDomainData(buf);
+      for (let i = 0; i < buf.length; i++) { const v = Math.abs(buf[i]); if (v > peak) peak = v; }
+      sounded++;
+    }
+    // Two seconds of a mix that ought to be audible, gathered whenever they happen. The outer cap
+    // is there so the analyser does not sit in the graph for the length of a run on a connection
+    // that never delivers - and it ends the probe without a verdict, because no verdict is the
+    // honest answer to never having heard anything.
+    if (sounded < 8) { if (++ticks > SILENCE_CAP) stop(); return; }
+    stop();
+    if (peak < 1e-4) fail('silent graph');
+  }, 250);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Cues.
+// ---------------------------------------------------------------------------
+// Decoded into an OfflineAudioContext rather than into the playing one, which is what lets this
+// run at boot instead of on the first tap: `decodeAudioData` needs a context to decode into, but
+// not a live one, and an offline context is not subject to the autoplay policy. The buffer it
+// produces plays in the real context whatever the two sample rates turn out to be - a source node
+// resamples a buffer that does not match.
+//
+// Which matters because the bank is 187 seconds of stereo and its decode is not instant. Doing it
+// while the title screen is being read means the first stamp of the run has a buffer to read from.
+function decodeCtx() {
+  if (AC) return AC;
+  const Off = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!Off) return ctx();
+  try { return new Off(2, 1, 48000); } catch (e) { return ctx(); }
+}
+
+function loadBank(url) {
+  if (bankLoad === 'loading' || bankLoad === 'ready') return;
+  bankLoad = 'loading';
+  const ac = decodeCtx();
+  fetch(url).then(function (r) {
+    if (!r.ok) throw new Error('bank ' + r.status);
+    bankTotal = Number(r.headers.get('content-length')) || SFX_BANK_BYTES || 0;
+    // Read in chunks rather than straight to an ArrayBuffer, purely so the title screen can say
+    // how far along it is. A bar that moves is the difference between a wait and a hang, and on a
+    // slow connection this is the wait the whole loading gate exists for.
+    if (!r.body || !bankTotal) return r.arrayBuffer();
+    const reader = r.body.getReader(), parts = [];
+    return (function pump() {
+      return reader.read().then(function (res) {
+        if (res.done) {
+          const out = new Uint8Array(bankGot);
+          let at = 0;
+          for (const p of parts) { out.set(p, at); at += p.length; }
+          return out.buffer;
+        }
+        parts.push(res.value); bankGot += res.value.length;
+        return pump();
+      });
+    })();
+  }).then(function (data) {
+    // The callback form, not the promise one: older mobile Safari only has this signature, and the
+    // two-argument call works on every engine that has either.
+    ac.decodeAudioData(data, function (buf) {
+      bankBuf = buf; bankLoad = 'ready'; bankGot = bankTotal;
+      beginStage(0);                     // the music only starts downloading once the cues are in
+    }, function () { bankLoad = 'failed'; fail('bank decode'); beginStage(0); });
+  }).catch(function () { bankLoad = 'failed'; fail('bank fetch'); beginStage(0); });
+}
+
+// One slice, gated so it cannot run past the end of the buffer. The render is a little shorter
+// than its own map - the tail of the last cue was trimmed - so the clamp is load-bearing for
+// exactly one segment and free insurance for the other sixty-five.
+function playSlice(t, off, len, gain) {
+  const dur = Math.min(len, bankBuf.duration - off);
+  if (dur <= .02) return;
+  const src = AC.createBufferSource();
+  src.buffer = bankBuf;
+  const g = AC.createGain();
+  const v = Math.max(.0002, gain);
+  const fade = Math.min(BANK_FADE, dur / 3);
+  g.gain.setValueAtTime(.0001, t);
+  g.gain.linearRampToValueAtTime(v, t + fade);
+  g.gain.setValueAtTime(v, t + dur - fade);
+  g.gain.linearRampToValueAtTime(.0001, t + dur);
+  src.connect(g); g.connect(sfxBus);
+  src.start(t, off, dur);
+  src.stop(t + dur + .02);
+  // A buffer source disconnects itself on ended; the gain in front of it does not, and sixty of
+  // them an hour left connected is how the old engine leaked its graph.
+  src.onended = function () { try { src.disconnect(); g.disconnect(); } catch (e) {} };
+}
+
+// The rule the crossfade uses, applied to the cue: every mode above the audibility floor sounds at
+// once, at the weight its stem is carrying, so a cue heard during a transition is in both timbres
+// exactly as the music under it is.
+function playSfx(id) {
+  if (!AC || bankLoad !== 'ready') return;
+  const seg = BANK[id];
+  if (!seg) return;
+  if (AC.state === 'suspended') AC.resume();
+  const w = solo >= 0 ? [0, 1, 2].map(i => (i === solo ? 1 : 0)) : busWeights(suspicion);
+  const t = AC.currentTime + .03;
+  for (let m = 0; m < 3; m++) if (w[m] > BUS_AUDIBLE) playSlice(t, seg[m * 2], seg[m * 2 + 1], w[m]);
+  // Ducking is a property of the cue and not of how it was made, so it is read off the engine's
+  // table rather than copied into a second one. That table is a plain object built at load; the
+  // lookup does not create a context or start anything.
+  const d = WTHAudio.cueDuck(id);
+  if (d) duck(d[0], d[1]);
+}
+
+function duck(amount, dur) {
+  if (!AC) return;
+  const t = AC.currentTime;
+  musicDuck.gain.cancelScheduledValues(t);
+  musicDuck.gain.setValueAtTime(musicDuck.gain.value, t);
+  musicDuck.gain.linearRampToValueAtTime(Math.max(.15, 1 - amount), t + .04);
+  musicDuck.gain.linearRampToValueAtTime(1, t + .04 + dur);
+}
+
+// ---------------------------------------------------------------------------
+// 7. The two endings.
+// ---------------------------------------------------------------------------
+// The loop goes out under the theme rather than before it: a run that ends in silence and then
+// starts a piece of music reads as a load, not as an ending. Half a second of overlap is enough
+// for one to hand over to the other.
+//
+// Nothing here fades the theme out at its own end. `defeat` is rendered with its exit already in
+// it - the last three seconds run -24, -30, -41 dBFS - and doubling that with a ramp would only
+// make it disappear early. `victory` ends where it ends.
+function playTheme(which) {
+  const el = themeEl[which];
+  if (!el) return;
+  ctx();
+  stop(.5);
+  themeName = which;
+  const t = AC.currentTime;
+  try { el.currentTime = 0; } catch (e) {}
+  el.play().catch(function () {});
+  themeGain.gain.cancelScheduledValues(t);
+  themeGain.gain.setValueAtTime(.0001, t);
+  themeGain.gain.setValueAtTime(.0001, t + .15);
+  themeGain.gain.linearRampToValueAtTime(1, t + .5);
+}
+
+function stopTheme(fade) {
+  if (!themeName || !AC) return;
+  const el = themeEl[themeName], f = fade === undefined ? .3 : fade, t = AC.currentTime;
+  themeName = null;
+  themeGain.gain.cancelScheduledValues(t);
+  themeGain.gain.setValueAtTime(Math.max(.0001, themeGain.gain.value), t);
+  themeGain.gain.linearRampToValueAtTime(.0001, t + f);
+  setTimeout(function () { try { el.pause(); el.currentTime = 0; } catch (e) {} }, (f + .1) * 1000);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Public interface. The engine's names, so 07_audio.js can hold either.
+// ---------------------------------------------------------------------------
+return {
+  /** Whether this browser and this protocol can play the bundled files at all. Checked before
+   *  anything is fetched; see the comment on supported(). */
+  supported: supported,
+
+  /** Called if the file path gives up after it has already been chosen - a file that will not
+   *  load, a bank that will not decode, a graph that turns out to be silent. One argument, a
+   *  short reason, and it fires at most once. */
+  //
+  //  A failure can land BEFORE anyone has registered for it: the downloads start at boot and the
+  //  callback is wired on the first tap, so a stem that 404s has already given up by the time
+  //  there is anybody to tell. Hence the replay - and deferred rather than immediate, because the
+  //  caller is mid-way through choosing a backend and is not ready to be told it chose wrong.
+  onFail(fn) {
+    failCb = fn;
+    if (failed && fn) setTimeout(function () { fn(failReason); }, 0);
+    return this;
+  },
+
+  /** Start loading, and nothing else. No context, no gesture, no sound - safe to call at boot.
+   *  Only the cue bank actually starts here; the five media elements are created empty and are
+   *  given their sources a stage at a time behind it. See STAGES. */
+  preload(bankUrl) { createElements(); if (bankUrl) loadBank(bankUrl); else beginStage(0); return this; },
+
+  /** How far the load has got, 0..1, and whether the run may start.
+   *
+   *  Two things are waited for and the second is nearly free. The cue bank, because a cue is
+   *  instant feedback on a tap and cannot be late, and it is one fetch that is worth nothing until
+   *  it is whole. And the heaven stem at `readyState` 4 - the browser's own promise that it can
+   *  play the file to the end without stalling, not merely start it. That promise arrives about
+   *  half a second after the stem begins downloading, at every link speed measured, because the
+   *  renders are 71 kbit content and any connection at all can carry them in real time; what the
+   *  browser is waiting for is a lead and a rate, not the file.
+   *
+   *  The other two stems are not waited for. They are minutes away at the meter's fastest, and
+   *  `readyWeights` holds the previous arrangement up if one of them is somehow still missing.
+   *
+   *  A failure opens the gate at once rather than holding it to the timeout: the fallback has the
+   *  session by then and there is nothing left to arrive. */
+  loadProgress() {
+    const heaven = elByName.heaven;
+    return {
+      ready: failed || bankLoad === 'failed' || (bankLoad === 'ready' && !!heaven && heaven.readyState >= 4),
+      bank: bankLoad,
+      // Two thirds of the bar is the bank, because that is the part that takes the time; the last
+      // third is the stem getting its lead, so the bar does not sit full while nothing can play.
+      value: (bankLoad === 'ready' ? 1 : bankTotal ? Math.min(1, bankGot / bankTotal) : 0) * .67
+           + (heaven ? Math.min(1, heaven.readyState / 4) : 0) * .33,
+    };
+  },
+
+  /** Create the AudioContext and bless the five media elements. Call FROM A TAP HANDLER. */
+  init() { ctx(); startElements(); return this; },
+
+  /** Start the soundtrack loop. fromSec is an optional starting point. */
+  play(fromSec) { play(fromSec || 0); return this; },
+
+  /** Stop with a fade (0.4 s by default). */
+  stop(fade) { stop(fade); return this; },
+
+  /** Suspicion 0..100. Safe to call every frame; the ramp is smooth on its own. */
+  setSuspicion(v) { setSuspicion(v); return this; },
+
+  /** A cue. Takes the weight of the current mix by itself, and inside a transition sounds in
+   *  both timbres. Silent until the bank has decoded, and never an error before then. */
+  sfx(id) { playSfx(id); return this; },
+
+  /** Start loading the cue bank. Call FROM A TAP HANDLER, like init - it needs a context to
+   *  decode into. Fire and forget. */
+  bank(url) { loadBank(url); return this; },
+
+  /** 'idle', 'loading', 'ready' or 'failed'. */
+  bankState() { return bankLoad; },
+
+  /** `readyState` per file, by name. 0 is nothing, 3 is "can start", 4 is "can play to the end
+   *  without stalling" - the browser's own estimate, and the one the loading gate reads. */
+  readyStates() {
+    const o = {};
+    for (let i = 0; i < stemEl.length; i++) o[STEMS[i]] = stemEl[i].readyState;
+    for (const n in themeEl) o[n] = themeEl[n].readyState;
+    return o;
+  },
+
+  /** Ending theme: 'victory' or 'defeat'. Takes the loop down under itself. */
+  theme(which) { playTheme(which); return this; },
+
+  /** Volume 0..1. */
+  volume(v) {
+    if (AC) userVol.gain.setTargetAtTime(Math.pow(clamp(v, 0, 1), 1.6), AC.currentTime, .05);
+    return this;
+  },
+
+  /** Play one mode alone, 0..2, or -1 for the meter's own mix. The dev panel's A/B for the
+   *  crossfade: it is the only way to hear a stem the meter is not currently asking for. */
+  solo(i) { solo = (i === undefined || i === null) ? -1 : (i | 0); applySuspicion(true); return this; },
+
+  /** Present so that a caller holding either player can call them without asking which it is.
+   *  Nothing in the file path has tiers, a hall or a channel count to cull. */
+  quality() { return this; },
+  reverb() { return this; },
+  cull() { return this; },
+  mute() { return this; },
+
+  /** Current state, for the dev panel. */
+  state() {
+    return {
+      backend: 'files', playing: running, theme: themeName,
+      pos: posSec(), total: stemEl.length && stemEl[0].duration ? stemEl[0].duration : 0,
+      suspicion, bank: bankLoad, failed: failed, failReason: failReason,
+      stage: stageIdx,
+      // The two numbers that say whether the three elements are still one piece of music: the
+      // worst offset seen since the loop started, in ms, and how many times a stem had to be
+      // seeked back rather than walked back.
+      drift: Math.round(driftWorst * 1000), seeks: driftSeeks,
+      solo: solo,
+      gains: stemGain.map(g => g.gain.value),
+      sampleRate: AC ? AC.sampleRate : 0,
+      baseLatency: AC ? (AC.baseLatency || 0) : 0,
+      outputLatency: AC ? (AC.outputLatency || 0) : 0,
+    };
+  },
+
+  /** Reference tables. */
+  SFX_IDS: Object.keys(BANK),
+  STEMS: STEMS.slice(),
+};
+
+})();
+
+// ==========================================================================
 // 98_audio_engine.js
 // ==========================================================================
 
@@ -10419,7 +11425,14 @@ function renderTutorial(ctx, y) {
 // it between the game modules a reader is trying to follow.
 //
 // The game never calls into this directly. 07_audio.js is the only translator, and it maps the
-// game's own event names onto the fifteen cues this exposes.
+// game's own event names onto the cues this exposes.
+//
+// SINCE THE SOUND PASS IT IS THE FALLBACK, NOT THE DEFAULT. The soundtrack and the cues ship as
+// six .opus renders played by 97_audio_files.js, and this file is what runs when they cannot be:
+// a browser with no Ogg Opus decoder, or a page opened over file://, where a media element
+// reaches the graph as silence and a fetch never starts. It is kept whole rather than trimmed
+// because it is the only thing standing between either of those and a silent submission, and
+// dormant it costs nothing - no context, no nodes, no timers, one object literal at load.
 // ============================================================================
 
 /*! Welcome to Heaven(TM) - procedural soundtrack and sound effects.
@@ -11571,124 +12584,27 @@ function duck(amount, dur){
 }
 
 // ---------------------------------------------------------------------------
-// 6c. The sample bank - the same twenty-two cues in the same three modes, rendered
-//     offline into one file and played back as slices of it.
+// 6c. The sample bank used to live here, and does not any more.
 //
-//     It exists to be compared against section 6, not to replace it: the synthesised
-//     cues are what the build ships with, and this is the A/B. So it borrows
-//     everything it can from the path beside it - the same mode weights, the same
-//     crossfade rule, the same duck out of SCUE - and the only thing that differs
-//     between the two is where the waveform came from.
+//     It was written as the A/B against section 6 and it won: the build now plays
+//     the rendered cues out of sfx.opus, and this file is the fallback for the two
+//     cases a file cannot serve. Which is exactly why the bank could not stay -
+//     the reasons that send a build down this path are a browser that will not
+//     decode Ogg Opus and a page on an opaque origin that cannot fetch at all, and
+//     neither of those can load a bank either. A second copy of the loader here
+//     would be code unreachable by construction.
 //
-//     Three consequences of that are worth naming. It is one file and one decode:
-//     sixty-six separate files would be sixty-six requests and the same bytes with
-//     more headers on them. It is optional: the load is fire and forget, and every
-//     failure - no file, a browser that will not fetch over file://, a decode that
-//     throws - leaves `bankLoad` at 'failed' and playSfx on the synthesised path,
-//     which is the fallback the GDD asked for. And it is not free: a three-minute
-//     stereo file is tens of megabytes of decoded float, which is the argument
-//     against shipping it as the default rather than against having it.
+//     It is in 97_audio_files.js now, with the cut map beside it. What stayed is
+//     the duck, because that belongs to the cue rather than to the waveform, and
+//     the file player reads it back out through `cueDuck` below rather than keeping
+//     a second table of the same fourteen numbers.
 // ---------------------------------------------------------------------------
-// id -> [heaven start, length, middle start, length, hell start, length], all seconds.
-// Taken from the pack's own map file; the gap between segments is 0.12 s.
-const BANK = {
-  checkin:    [  0.000,1.641,    1.761,1.592,    3.473,1.903],
-  reassign:   [  5.496,1.575,    7.191,1.533,    8.844,1.842],
-  deny:       [ 10.806,2.288,   13.214,2.224,   15.558,2.669],
-  scroll:     [ 18.347,0.351,   18.818,0.335,   19.273,0.392],
-  shop:       [ 19.785,1.642,   21.547,1.586,   23.253,1.883],
-  purchase:   [ 25.256,2.509,   27.885,2.438,   30.443,2.924],
-  nofunds:    [ 33.487,0.944,   34.551,0.915,   35.586,1.095],
-  soul:       [ 36.801,1.803,   38.724,1.739,   40.583,2.063],
-  expire:     [ 42.766,1.421,   44.307,1.372,   45.799,1.628],
-  processed:  [ 47.547,1.162,   48.829,1.124,   50.073,1.336],
-  snap:       [ 51.529,1.778,   53.427,1.714,   55.261,2.032],
-  quotaMet:   [ 57.413,3.292,   60.825,3.194,   64.139,3.819],
-  quotaFail:  [ 68.078,5.376,   73.574,5.249,   78.943,6.339],
-  dayStart:   [ 85.402,3.884,   89.406,3.771,   93.297,4.516],
-  elevator:   [ 97.933,3.059,  101.112,2.988,  104.220,3.612],
-  suspicion:  [107.952,0.954,  109.026,0.919,  110.065,1.087],
-  relief:     [111.272,2.325,  113.717,2.247,  116.084,2.673],
-  susp40:     [118.877,2.559,  121.556,2.488,  124.164,2.987],
-  susp75:     [127.271,4.534,  131.925,4.421,  136.466,5.329],
-  riot:       [141.915,5.534,  147.569,5.421,  153.110,6.579],
-  goodPerson: [159.809,5.584,  165.513,5.471,  171.104,6.641],
-  lose:       [177.865,3.768,  181.753,3.626,  185.499,4.286],
-};
-// One trim for all sixty-six slices, and it cannot be right for all of them, because the two
-// paths do not have the same dynamics. The synthesised cues keep the range their note data
-// asks for - a peak of about .08 into sfxBus for `scroll`, about .8 for `riot`, a factor of
-// ten between the smallest cue and the largest. The bank was mastered flat: measured off the
-// file, `scroll` peaks at -3.5 dBFS and `riot` at +1.2, a factor of under two. So matching the
-// quiet end wants a gain near .21 and the loud end near .70, and this is the middle of those.
-// The consequence is audible and worth knowing before listening: on the bank the small cues
-// that fire constantly sit louder than they do on the synth, and the rare big ones sit softer.
-// This is the one number to turn if the comparison is being made by ear.
-const BANK_GAIN = .38;
-const BANK_FADE = .012;      // in and out, so a slice never starts or stops on a step
-
-let bankBuf = null;
-let bankLoad = 'idle';       // idle | loading | ready | failed
-let sfxMode = 'synth';       // 'synth' | 'sample'
-
-function loadBank(url){
-  if (bankLoad === 'loading' || bankLoad === 'ready') return;
-  bankLoad = 'loading';
-  // Needs a context to decode into, so this has to be called from the same gesture that
-  // creates one. Everything after the fetch runs later, by which time AC is long since up.
-  const ac = ctx();
-  fetch(url).then(function (r) {
-    if (!r.ok) throw new Error('bank ' + r.status);
-    return r.arrayBuffer();
-  }).then(function (data) {
-    // The callback form, not the promise one: older mobile Safari only has this signature,
-    // and the two-argument call works on every engine that has either.
-    ac.decodeAudioData(data, function (buf) {
-      bankBuf = buf; bankLoad = 'ready';
-    }, function () { bankLoad = 'failed'; });
-  }).catch(function () { bankLoad = 'failed'; });
-}
-
-// One slice, gated so it cannot run past the end of the buffer. The pack's file is a little
-// shorter than its own map - the tail of the last cue was trimmed off the render - so the
-// clamp is load-bearing for exactly one segment and free insurance for the other sixty-five.
-function playSlice(t, off, len, gain){
-  const dur = Math.min(len, bankBuf.duration - off);
-  if (dur <= .02) return;
-  const src = AC.createBufferSource();
-  src.buffer = bankBuf;
-  const g = AC.createGain();
-  const v = Math.max(.0002, gain * BANK_GAIN);
-  const fade = Math.min(BANK_FADE, dur / 3);
-  g.gain.setValueAtTime(.0001, t);
-  g.gain.linearRampToValueAtTime(v, t + fade);
-  g.gain.setValueAtTime(v, t + dur - fade);
-  g.gain.linearRampToValueAtTime(.0001, t + dur);
-  src.connect(g); g.connect(sfxBus);
-  src.start(t, off, dur);
-  src.stop(t + dur + .02);
-  reg(src, t + dur + .02, t);
-  reg(g, t + dur + .02, t, true);
-}
-
-// The same rule the synthesised path uses: every mode above the audibility floor sounds at
-// once, at the weight its bus is carrying. Returns false when it cannot, so playSfx can fall
-// through to section 6 rather than dropping the cue.
-function playBank(id, w, t){
-  const seg = BANK[id];
-  if (!seg || !bankBuf) return false;
-  for (let m = 0; m < 3; m++) if (w[m] > .18) playSlice(t, seg[m * 2], seg[m * 2 + 1], w[m]);
-  return true;
-}
-
 function playSfx(id){
   ctx();
   const cue = SCUE[id]; if (!cue) return;
   const w = solo >= 0 ? [0, 1, 2].map(i => (i === solo ? 1 : 0)) : busWeights(suspicion);
   const t = AC.currentTime + .03;
-  const sampled = sfxMode === 'sample' && bankLoad === 'ready' && playBank(id, w, t);
-  if (!sampled) for (let m = 0; m < 3; m++) if (w[m] > .18) renderCue(cue, m, t, w[m]);
-  // Ducking is a property of the cue, not of how it was made, so it happens either way.
+  for (let m = 0; m < 3; m++) if (w[m] > .18) renderCue(cue, m, t, w[m]);
   if (cue.duck) duck(cue.duck[0], cue.duck[1]);
 }
 
@@ -11777,19 +12693,16 @@ return {
    *  and inside the transition zone sounds in both. */
   sfx(id){ playSfx(id); return this; },
 
-  /** Start loading the rendered sample bank from a relative path. Call FROM A TAP
-   *  HANDLER, like init - it needs a context to decode into. Fire and forget: nothing
-   *  waits on it, and a failure just leaves every cue on the synthesised path. */
-  bank(url){ loadBank(url); return this; },
+  /** How far a cue ducks the music and for how long, or null. Read by the file player in
+   *  97_audio_files.js, which plays the same cues out of a render and needs the same duck.
+   *  A plain lookup in a table built at load - it starts nothing and creates no context, so
+   *  it is safe to call on a build that is not using this engine at all. */
+  cueDuck(id){ const c = SCUE[id]; return c && c.duck ? c.duck : null; },
 
-  /** Where sound effects come from. 'synth' renders each cue from the note data,
-   *  'sample' plays it out of the bank. Pass nothing to read the current setting.
-   *  Switching to 'sample' before the bank is ready is not an error - cues stay
-   *  synthesised until the decode lands. */
-  sfxSource(mode){ if (mode) sfxMode = mode === 'sample' ? 'sample' : 'synth'; return sfxMode; },
-
-  /** 'idle', 'loading', 'ready' or 'failed'. */
-  bankState(){ return bankLoad; },
+  /** Present so that a caller holding either player can call them without asking which it
+   *  is. This one synthesises every cue and has nothing to load up front. */
+  bank(){ return this; },
+  bankState(){ return 'ready'; },
 
   /** Ending theme: 'victory' (day 10 survived) or 'defeat' (Suspicion 100).
    *  Stops the loop by itself. */
@@ -11832,6 +12745,7 @@ return {
   /** Current state, for debugging and the HUD. */
   state(){
     return {
+      backend: 'synth',
       playing: running, theme: themeId >= 0 ? NAMES[themeId] : null,
       pos: posSec(), total: TOTAL_SEC,
       bar: running ? Math.floor(secToU(posSec()) / BAR_U) + 1 : 0,
@@ -11936,6 +12850,10 @@ function boot() {
   resetGame();
   initScene();
   gotoTitle();
+  // Downloads only, and deliberately after the first screen is up rather than before it: nothing
+  // on the title waits for audio, and the fetches should be competing with a drawn screen instead
+  // of delaying one. See preloadAudio in 07_audio.js.
+  preloadAudio();
 
   window.addEventListener('resize', resizeDisplay);
   window.addEventListener('orientationchange', resizeDisplay);
@@ -12036,44 +12954,46 @@ function cheatToggleMusic() {
   return soundEnabled() ? 'MUTE' : 'UNMUTE';
 }
 
-// The A/B for the sound pass. Both paths are in the shipped engine and both use the same cue
-// table, mode weights and ducking, so flipping this mid-run changes exactly one thing: whether a
-// cue is built out of oscillators or read out of the rendered bank.
-let cheatSfxBtn = null;     // the one button whose label can change without being pressed
-let cheatSfxWatch = null;
-
-// The label names what is playing NOW, not what pressing would do - so it is read off the engine
-// rather than composed from the request. (MUTE next to it means the opposite: it is the action,
-// not the state. The two have always disagreed; this one is the way round that suits a control
-// whose whole job is to answer "which of the two am I listening to?".)
-function cheatSfxLabel() {
-  const src = WTHAudio.sfxSource();
-  if (src !== 'sample') return 'SFX SYNTH';
-  // Asking for the bank before the decode has landed is allowed and leaves cues synthesised.
-  // Saying so is the difference between hearing no change and hearing no change for a reason.
-  const load = WTHAudio.bankState();
-  return load === 'ready' ? 'SFX OGG' : 'SFX OGG ' + load.toUpperCase();
+// The A/B that matters now: which of the two players is running. Both answer the same calls, use
+// the same cue names, the same mode weights and the same ducking, so flipping this mid-run changes
+// exactly one thing - whether what comes out was recorded or is being built a note at a time.
+//
+// It restarts the music from the top, because handing a position from one player to the other is a
+// promise neither of them can keep: the engine's clock is its own scheduler and the file player's
+// is three media elements. And it leaves both AudioContexts alive, which is the one thing here
+// that a shipped build would never do. It is a comparison, not a mode.
+function cheatBackendLabel() {
+  return audioBackend() === WTHFiles ? 'SRC FILES' : 'SRC SYNTH';
 }
 
-function cheatToggleSfxSource() {
-  const want = WTHAudio.sfxSource() === 'sample' ? 'synth' : 'sample';
-  // A build shipped on 'synth' never fetches the file, so the first flip is what asks for it.
-  // The call is idempotent, so flipping back and forth costs one download.
-  if (want === 'sample') WTHAudio.bank(SFX_BANK);
-  WTHAudio.sfxSource(want);
-  // A label only redrawn on click would sit on LOADING until the next press, which is exactly
-  // the wrong moment to be wrong: the first press is the one that orders the file. So the decode
-  // gets watched to its end. Guarded against a second press starting a second watcher.
-  if (want === 'sample' && WTHAudio.bankState() === 'loading' && !cheatSfxWatch) {
-    cheatSfxWatch = setInterval(function () {
-      if (WTHAudio.bankState() === 'loading') return;
-      clearInterval(cheatSfxWatch); cheatSfxWatch = null;
-      // Not if the player flipped back to the synthesiser while it was decoding - then the label
-      // is already right and rewriting it would announce a source that is not playing.
-      if (cheatSfxBtn && WTHAudio.sfxSource() === 'sample') cheatSfxBtn.textContent = cheatSfxLabel();
-    }, 200);
-  }
-  return cheatSfxLabel();
+function cheatToggleBackend() {
+  const to = audioBackend() === WTHFiles ? WTHAudio : WTHFiles;
+  if (to === WTHFiles && !WTHFiles.supported()) return 'SRC SYNTH ONLY';
+  const playing = audioBackend().state().playing;
+  audioBackend().stop(0.2);
+  if (to === WTHAudio) WTHAudio.quality(detectAudioQuality());
+  to.init();
+  to.volume(soundEnabled() ? MUSIC_VOLUME : 0);
+  to.bank(SFX_BANK);
+  to.setSuspicion(state.suspicion);
+  A = to;
+  if (playing) to.play();
+  return cheatBackendLabel();
+}
+
+// The crossfade, taken apart. The meter decides which of the three arrangements is audible, so
+// most of a run never hears two of them, and there is no other way to answer "is the hell mix
+// actually in this build, and is it aligned with the others". Files only - the engine has a solo
+// inside it and no way in from out here, and adding one to a fallback is not worth the line.
+const CHEAT_SOLO = [-1, 0, 1, 2];
+const CHEAT_SOLO_NAME = ['SOLO OFF', 'SOLO HVN', 'SOLO MID', 'SOLO HELL'];
+let cheatSolo = 0;
+function cheatCycleSolo() {
+  const b = audioBackend();
+  if (!b || !b.solo) return 'SOLO N/A';
+  cheatSolo = (cheatSolo + 1) % CHEAT_SOLO.length;
+  b.solo(CHEAT_SOLO[cheatSolo]);
+  return CHEAT_SOLO_NAME[cheatSolo];
 }
 
 // Two buttons for diagnosing a device that crackles, because the fault has three possible homes
@@ -12082,20 +13002,18 @@ function cheatToggleSfxSource() {
 // the reverb is the most expensive single node in the graph, so if removing it does nothing then
 // the cost is not the fixed graph, and what is left is what a note costs to build.
 //
+// They speak to the engine by name rather than to whichever player is running, because there is
+// nothing in the file player for either of them to move: it has no tiers, no channels to silence
+// and no hall. On a build in its shipped state they change nothing audible, which is the correct
+// answer and not a bug - press SRC SYNTH first.
+//
 // Note the runtime limit when reading a result off these. The reverb's length and the shaper's
 // oversampling are fixed when the context is built, so pressing AQ down to 'low' here gives less
-// than a device that booted on 'low' - which does not affect the finding above, because the two
-// things it cannot change here are the two HALL OFF already ruled out.
-//
-// Cycles rather than toggles, because the phone measurement that mattered was the one in between:
-// high crackled, low did not, and there was nothing to press to find out how much of low was
-// needed. Reads the engine for its starting label instead of assuming one, since 'auto' means the
-// device may already have chosen mid before this button is ever touched.
+// than a device that booted on 'low'.
 const CHEAT_AQ = ['high', 'mid', 'low'];
 // The other half of the same question, and deliberately a separate button. The tier changes what a
-// NOTE costs to build; this changes how many notes there are. Every phone reading so far moved both
-// at once - 'low' does eight things, and one of them is silencing whole channels - so neither could
-// be credited. Rungs: 4 silences texture and drone, 5 adds ostin, 6 adds arp and lowstr.
+// NOTE costs to build; this changes how many notes there are. Rungs: 4 silences texture and drone,
+// 5 adds ostin, 6 adds arp and lowstr.
 const CHEAT_CULL = [0, 4, 5, 6];
 function cheatCycleCull() {
   const now = WTHAudio.state().cull;
@@ -12118,34 +13036,45 @@ function cheatToggleReverb() {
 }
 
 // The reading that says which half of the machine is at fault, on a device that has no console.
-// L is scheduler ticks that arrived more than 120 ms late - the main thread was blocked and the
-// notes went out late, which is a renderer problem. W is the worst such gap in milliseconds. V is
-// live nodes right now. Crackling with L near zero means the main thread was fine and the audio
-// thread is the one drowning, which is a synthesis problem. The two sound identical and are fixed
-// in opposite files. Both counters run from the moment the context was created and nothing in the
-// engine acts on them.
-// B and T were one number to begin with, added together, and that was useless: `baseLatency` is the
-// buffer `latencyHint` actually asks for and `outputLatency` is everything after it - the OS mixer,
-// the speaker, a Bluetooth hop - which can be a hundred milliseconds of hardware we do not control
-// and cannot do anything about. Summed, "the hint was honoured and the headphones are wireless"
-// reads exactly the same as "the hint was ignored". So B is the buffer, in frames, and it is the
-// one to check first: it should say 2048, and if it says 128 the request was refused and nothing
-// else in this readout means what it looks like. T is the whole trip to the speaker in ms.
+// Two players, two readouts, because they fail in different ways and a shared one would have to
+// leave out what each of them is actually asked.
 //
-// V is a PEAK, not a snapshot - the most nodes alive at once since the context was made. A live
-// reading was worth nothing, because the button is pressed at whatever moment the hand arrives and
-// the interesting moment is the busiest bar, which is never that one.
+// On FILES: the second word is the cue decode, and until it says READY every stamp is silent. D is
+// the worst offset seen between the three stems since the loop started, in ms, and S how many times
+// one had to be seeked back rather than walked back - those two are the whole health of the
+// crossfade. A D that climbs is a decoder falling behind; an S that climbs on a stem you can hear
+// is audible as a click. P is where in the eight minutes the loop is. X names the reason the file
+// path gave up, if it did, in which case the engine is already playing and this is the wrong
+// readout to be reading.
 //
-// Q is the tier actually in force, H/M/L. It is here rather than on the AQ button because with
-// AUDIO_QUALITY on 'auto' the device picks its own on the first tap, so a label baked into the
-// panel at load would be a guess - and the one thing a diagnostic must never do is guess.
+// On SYNTH: L is scheduler ticks that arrived more than 120 ms late - the main thread was blocked
+// and the notes went out late, which is a renderer problem. W is the worst such gap in ms. V is a
+// PEAK, not a snapshot - the most nodes alive at once since the context was made; a live reading
+// was worth nothing, because the button is pressed at whatever moment the hand arrives and the
+// interesting moment is the busiest bar, which is never that one. Crackling with L near zero means
+// the main thread was fine and the audio thread is the one drowning, which is a synthesis problem.
+// The two sound identical and are fixed in opposite files.
+//
+// B and T were one number to begin with, added together, and that was useless: `baseLatency` is
+// the buffer `latencyHint` actually asks for and `outputLatency` is everything after it - the OS
+// mixer, the speaker, a Bluetooth hop - which can be a hundred milliseconds of hardware we do not
+// control. Summed, "the hint was honoured and the headphones are wireless" reads exactly the same
+// as "the hint was ignored". So B is the buffer, in frames, and it is the one to check first: it
+// should say 2048, and if it says 128 the request was refused and nothing else here means what it
+// looks like. T is the whole trip to the speaker in ms. Both are the same on either player.
 function cheatAudioStats() {
-  const s = WTHAudio.state();
-  return 'Q' + s.quality.toUpperCase().slice(0, 1) + ' C' + s.cull +
+  const s = audioBackend().state();
+  const tail = ' B' + Math.round(s.baseLatency * s.sampleRate) +
+               ' T' + Math.round((s.baseLatency + s.outputLatency) * 1000);
+  if (s.backend === 'files') {
+    return 'FILES ' + s.bank.toUpperCase() +
+           ' D' + s.drift + ' S' + s.seeks +
+           ' P' + Math.round(s.pos) + tail +
+           (s.failed ? ' X:' + s.failReason : '');
+  }
+  return 'SYNTH Q' + s.quality.toUpperCase().slice(0, 1) + ' C' + s.cull +
          ' L' + s.late + ' W' + Math.round(s.worstGap * 1000) +
-         ' V' + s.peakVoices + ' D' + s.dropped +
-         ' B' + Math.round(s.baseLatency * s.sampleRate) +
-         ' T' + Math.round((s.baseLatency + s.outputLatency) * 1000);
+         ' V' + s.peakVoices + ' D' + s.dropped + tail;
 }
 
 function cheatCycleSpeed() {
@@ -12169,7 +13098,8 @@ const CHEAT_BUTTONS = [
   ['EXPIRE',   cheatExpireAll],
   ['+SOUL',    cheatSpawnSoul],
   ['MUTE',     cheatToggleMusic],
-  [SFX_SOURCE === 'sample' ? 'SFX OGG' : 'SFX SYNTH', cheatToggleSfxSource],
+  [AUDIO_SOURCE === 'files' ? 'SRC FILES' : 'SRC SYNTH', cheatToggleBackend],
+  ['SOLO OFF', cheatCycleSolo],
   ['AQ CYCLE', cheatCycleQuality],
   ['CULL 0',   cheatCycleCull],
   ['HALL ON',  cheatToggleReverb],
@@ -12205,7 +13135,6 @@ function buildCheatPanel() {
   cheatStyle(body, { display: 'flex', flexWrap: 'wrap', gap: '2px' });
   for (const [label, action] of CHEAT_BUTTONS) {
     const b = cheatButton(label, '#2a2438', '#f2ead2');
-    if (action === cheatToggleSfxSource) cheatSfxBtn = b;
     b.addEventListener('click', function () {
       // Only a string renames the button - several of the actions return a boolean, and "true"
       // is not a useful label for anything.
@@ -12249,8 +13178,13 @@ frame = function (now) {
 // what is hung on `window` here and nothing else - which is why `state.tutorial.hold` read as
 // `undefined` from outside and every check against it quietly passed.
 window.__audio = WTHAudio;
+window.__files = WTHFiles;
 window.__dev = {
   state: state,
+  // Which player answered and how it is doing. The same reading the AUDIO? button prints, as an
+  // object rather than a line, so a harness can assert on it instead of parsing a label.
+  audio: function () { return audioBackend() ? audioBackend().state() : null; },
+  audioGate: function () { return { gated: audioGated(), value: audioLoadProgress() }; },
   input: function (cx, cy) {
     return { id: Input.pointerId, queued: Input.gestures.length, active: Input.drag.active,
              vx: cx === undefined ? null : Math.round(toVirtualX(cx)),
