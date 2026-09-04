@@ -727,6 +727,12 @@ const AUDIT_TIME = 3;             // the beam and the collapse before the lose s
 const TUTORIAL_LIFE = 5;          // seconds a beat that does not stop the day stays up
 const TUTORIAL_FADE = 0.2;        // and how long it takes to arrive and to leave
 const TUTORIAL_QUOTA_AT = 15;     // seconds into day one before the quota explains itself
+// How hard a held beat dims the scene behind it. A beat that only talks needs the screen to read as
+// waiting rather than as stuck, and half is enough for that. A beat that POINTS is cutting one row
+// out of the veil, and at half the rest of the docket is still perfectly readable - the eye has no
+// reason to go to the row being named, which is the whole job. Both are alpha, not a colour.
+const TUTORIAL_DIM = 0.5;
+const TUTORIAL_DIM_FOCUS = 0.78;
 const SPEAKER = { h: 50, pad: 5, gap: 6, pw: 32, ph: 40 };   // pw/ph is the portrait the art pass fills
 const SPEAKER_LINES = 3;          // the longest beat wraps to three at this width
 
@@ -1336,6 +1342,21 @@ function cubicleRect(i) {
   };
 }
 
+// The two floors as bands, for the onboarding beats that name them (GDD 8.4). Full width because
+// both strips scroll and neither has an end that is on screen; the lounge is the row of suites
+// rather than the whole sky above it, because the sky is weather and the suites are the floor.
+// Cut off the same numbers the slots are placed with, so a re-laid-out floor takes its spotlight
+// with it.
+function heavenFloorRect() {
+  const r = heavenSlotRect(0);
+  return { x: 0, y: r.y, w: VIEW_W, h: r.h };
+}
+
+function opsFloorRect() {
+  const z = Display.zones.ops;
+  return { x: 0, y: z.y, w: VIEW_W, h: z.h };
+}
+
 function cardRect() {
   const z = Display.zones.work;
   return {
@@ -1543,16 +1564,20 @@ function toggleSound() {
   if (audioReady) WTHAudio.volume(soundOn ? MUSIC_VOLUME : 0);
 }
 
-// Which tier this device gets, and it is 'mid' for a reason that only became visible once the
-// crossfade was measured in NODES rather than notes. During an overlap every tier is forced to one
-// oscillator layer with no modulators, so all three now peak at the same load - about 205 average
-// simultaneous nodes. The tiers differ only OUTSIDE an overlap, where low sits at 124 and mid at
-// 178, both under that shared peak. So low buys nothing at the moment that was actually breaking
-// and costs two thirds of every voice for the rest of the run: mid is strictly the better of the
-// two, same worst case and more music everywhere else.
+// 'low' on touch, and it is the measured answer rather than the cautious one. Mid was tried and
+// the test phone still crackles on it - lightly, on an empty lounge, and worse as the lounge fills.
+// Measured in average simultaneous nodes the two tiers are 178 and 124, and the device is evidently
+// somewhere between them.
 //
-// High is not chosen because its steady state, 265, is above the peak the other two share, and the
-// test phone reports light crackle there even away from a crossfade. It stays one button away.
+// This is the floor after a long sequence of fixes on both sides of the problem: two real faults in
+// the audio engine (voices that were never disconnected, and a crossfade that rendered two complete
+// arrangements) and four in the renderer, each one recomputing something stable at the frequency of
+// the thing that drew it. Every one of those is fixed and low is still what this phone wants, so
+// the remaining cost is the synthesis itself rather than anything wasteful around it.
+//
+// Low is much less of a sacrifice than it was: it now has the full stereo hall, every channel of
+// the arrangement and the desktop's caps, and differs in one way only - one oscillator layer per
+// voice, and no per-note modulators. See buildlog Session 43 for what has and has not been tried. It stays one button away.
 //
 // `pointer: coarse` is the test rather than a user-agent string: it asks what the device is being
 // driven with, which is the thing that correlates with a small battery-powered chip, and it does
@@ -1562,7 +1587,7 @@ function detectAudioQuality() {
   if (AUDIO_QUALITY !== 'auto') return AUDIO_QUALITY;
   const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
   const cores = navigator.hardwareConcurrency || 8;
-  return (coarse || cores <= 4) ? 'mid' : 'high';
+  return (coarse || cores <= 4) ? 'low' : 'high';
 }
 
 // The browser will not create an AudioContext outside a real user gesture, and our own input
@@ -1838,7 +1863,37 @@ const SPEAKER_NAME = 'YOUR ONBOARDING SPECIALIST';
 // first expiry always lands on day two, and the beat teaching the second half of the core loop
 // would have been the one beat nobody was ever made to read.
 const TUTORIAL = {
+  // The geography, before there is anything to do with it. These two are the only beats in the game
+  // that fire on an empty screen: they are queued in the first frame of day one, they hold, and a
+  // holding beat stops arrivals dead - so the first soul does not walk in until both floors have
+  // been named. That quiet moment is the only one a day has, and spending it on "what am I looking
+  // at" is what lets the first card be about the card.
+  //
+  // Two floors, one joke, told twice. What the basement actually is - a bank of desks with a
+  // suspiciously similar sales pitch attached - is the whole premise, and it lands harder as the
+  // second half of a pair than it would as an explanation.
+  floorHeaven: { hold: true, focus: 'floorHeaven',
+    text: 'Up here is the lounge. Heaven, as far as the guests know. It pays in ✦.' },
+  floorOps:    { hold: true, focus: 'floorOps',
+    text: 'Down here is Operations. Also heaven, as far as the guests know. It pays in ◈.' },
   firstCard: { hold: true,  text: 'Swipe up. Up is heaven. Up is also revenue.' },
+  // The two numbers the whole game is played off, taught on the first docket and not before: the
+  // card is on the desk, it is the only thing that has ever been on the desk, and the day is held
+  // behind the beat. `focus` names a target on screen rather than a rectangle - the plate dims the
+  // scene down to that one row, so the line and the thing the line is about are the only lit
+  // objects in the frame. Two beats and not one, because the point is that they are two axes: a
+  // single plate naming both would be read as one description of how good a soul is, which is the
+  // exact misreading the stat flip on 2 September was done to kill.
+  statSanctity:   { hold: true, focus: 'statSanctity',
+    text: 'Green is SANCTITY. Upstairs it is ✦ per second, and nothing else is.' },
+  // Two lit boxes rather than one: the red row and the Suspicion meter it feeds. The cost of a
+  // doubter in the LOUNGE is the half of this stat nothing else in the game ever says out loud -
+  // `deskSwipe` already teaches that a trusting soul pays best at a desk, and the worth line on the
+  // card prices that swipe anyway, but the drip a skeptic adds to the meter is invisible, arrives
+  // seconds later and is mixed in with every other source. Naming it while both ends of it are the
+  // only lit objects on screen is the only place it can be taught.
+  statSkepticism: { hold: true, focus: 'statSkepticism',
+    text: 'Red is SKEPTICISM. Upstairs it feeds Suspicion. At a desk it just pays less.' },
   deskSwipe: { hold: true,  text: 'Swipe down. Operations pays by the second, and a trusting soul pays best.' },
   denySwipe: { hold: true,  text: 'Swipe left. Turning one away costs ◈. A full lounge costs more.' },
   expiry:    { hold: true,  text: 'Their subscription lapsed. Tap them - the service elevator is discreet.' },
@@ -2935,32 +2990,50 @@ function chevronBadge(kind, side, report) {
   };
 }
 
-// The badge is twenty pixels wide, so it takes the standard hit box a button gets - which is wider
-// than the badge and can therefore reach a guest standing at the edge of the screen. `alerts` is
-// which kind of chevron this pass is looking for, and it is what resolves that overlap: see
-// handleFloorTap.
-function handleChevronTap(g, alerts) {
+// Which chevron a point is on, or null. `exact` is the whole of the difference between the passes
+// in handleFloorTap: it tests the plate AS DRAWN, and without it the plate is grown to HIT_MIN (38)
+// like every other button in the game - which, on a badge twenty pixels wide sitting one edge
+// margin in, reaches a long way over the nearest suite. `alerts` filters to one kind of chevron;
+// leaving it out asks for either.
+function chevronAt(x, y, exact, alerts) {
   for (const kind of ['heaven', 'ops']) {
     for (const side of [-1, 1]) {
       const report = edgeReport(kind, side);
-      if (!report || report.alert !== alerts) continue;
-      if (!tapHit(g, chevronBadge(kind, side, report))) continue;
-      scrollStripToSlot(kind, report.index);
-      sfx('scroll');
-      return true;
+      if (!report) continue;
+      if (alerts !== undefined && report.alert !== alerts) continue;
+      const badge = chevronBadge(kind, side, report);
+      if (!pointInRect(x, y, exact ? badge : hitRect(badge))) continue;
+      return { kind: kind, index: report.index };
     }
   }
-  return false;
+  return null;
 }
 
-// Three things can be under one finger at the edge of the screen, so they are tried in the order
-// of what the player most likely meant. A red chevron is an emergency out of sight and wins. A
-// guest that is on screen beats a white chevron, because a visible expired contract is worth more
-// than the free slot the white one is pointing at - and the white one is still there afterwards.
+function takeChevron(hit) {
+  if (!hit) return false;
+  scrollStripToSlot(hit.kind, hit.index);
+  sfx('scroll');
+  return true;
+}
+
+// Three things can be under one finger at the edge of the screen, so they are tried in the order of
+// what the player most likely meant - with one rule ahead of all of it: a tap on the plate AS DRAWN
+// belongs to the plate. The badge is opaque and it is the last thing painted over those pixels, so
+// anything else is the screen disagreeing with itself. A button that visibly sits on top of a guest
+// and answers with the guest is worse than no button, and that was the white chevron's behaviour
+// until now: the priority rule below was written about the GROWN box and was quietly deciding the
+// drawn one as well.
+//
+// Under the plate the old order still holds, and it is about that grown box. A red chevron is an
+// emergency out of sight and wins the margin around itself. A guest that is on screen beats a white
+// chevron's margin, because a visible expired contract is worth more than the free slot the white
+// one is pointing at - and the white one is still there afterwards, one plate-sized tap away.
 function handleFloorTap(g) {
-  if (handleChevronTap(g, true)) return;
+  if (g.type !== 'tap') return;
+  if (takeChevron(chevronAt(g.x, g.y, true))) return;
+  if (takeChevron(chevronAt(g.x, g.y, false, true))) return;
   if (handleSlotTap(g)) return;
-  handleChevronTap(g, false);
+  takeChevron(chevronAt(g.x, g.y, false, false));
 }
 
 // --- Repairing a wrecked suite (GDD 6.5) --------------------------------------
@@ -2998,6 +3071,12 @@ function serviceReady() {
 // hold), so the slot found here is the slot still under the thumb when the hold completes.
 function serviceSlotAt(x, y) {
   if (!serviceReady()) return -1;
+  // The same rule the tap order uses, at the other gesture. A finger that came down on the chevron
+  // plate is on the chevron and not on the suite behind it - and without this line a hold there
+  // would repair the wreck underneath and the release would then scroll, which is two answers to
+  // one gesture. Only the plate as drawn: the grown box is a courtesy for missing the button, and a
+  // courtesy has no business cancelling a repair.
+  if (chevronAt(x, y, true)) return -1;
   const count = visibleSlotCount(state.heavenSlots);
   for (let i = 0; i < count; i++) {
     if (!servableSlot(i)) continue;
@@ -4923,6 +5002,23 @@ const SPR_GUEST_MANAGER = {
 
 // SPR_GUEST_TAX  22x38  Tax Consultant
 // the narrowest silhouette in the deck, olive, with a case against one leg
+//
+// The case is at cols 14-20, rows 24-30, and the hand holding it is the two skin pixels at col 13,
+// rows 23-24, right against its top corner. The hanging arm on the other side ends in a hand of its
+// own at col 6, rows 25-26 - the bottom of the coat, with nothing below it. The asymmetry is the
+// pose: the arm carrying weight is raised, the empty one is not.
+//
+// It used to be a 2x2 block beside the hip with the hands halfway up the torso and sleeve
+// continuing underneath them, which read as something growing out of the suit rather than as a
+// wrist. Most of the roster puts its hands at that height and gets away with it, because those
+// people are holding something in front of them with both hands - the clipboard, the book - so the
+// hands are at the height of the thing they are on. This one holds nothing in front.
+//
+// The case cannot simply be moved down to hang from a lowered hand, and this is the constraint to
+// know before redrawing any of it: the lounge draws a guest whole and then composites the front
+// cloud layer over the feet, so the last row of a guest that is ever seen in a slot is ROW 28. A
+// case below that is a dark stub. Operations crops harder still, at DESK_BUST_ROWS = 26, which is
+// why nothing of the case shows at a desk and nothing needs to. Only the docket shows all 38 rows.
 const SPR_GUEST_TAX = {
   key: 'g_tax', w: 22, h: 38,
   // legend, darkest first (role name from the art pack, then the colour):
@@ -4967,14 +5063,14 @@ const SPR_GUEST_TAX = {
     '.....xEGGGGGGgx.......',   // 20
     '.....xEGGGGGGgx.......',
     '.....xEGGGGGGgx.......',
-    '.....xsGGGGGGsx.......',
-    '.....xkGGGGGGsskx.....',
-    '.....xEGGGGGGgxzZx....',   // 25
-    '.....xEGGGGGGgxzZx....',
-    '.....xTTxxTTx.........',
-    '.....xTTxxTTx.........',
-    '.....xTTxxTTx.........',
-    '.....xTTxxTTx.........',   // 30
+    '.....xEGGGGGGsx.......',
+    '.....xEGGGGGGsxxxxxxx.',
+    '.....xsGGGGGGgxZZZZZx.',   // 25
+    '.....xsGGGGGGgxZZZZZx.',
+    '.....xTTxxTTx.xZzzzZx.',
+    '.....xTTxxTTx.xZZZZZx.',
+    '.....xTTxxTTx.xzzzzzx.',
+    '.....xTTxxTTx.xxxxxxx.',   // 30
     '.....xTTxxTTx.........',
     '.....xTTxxTTx.........',
     '.....xTTxxTTx.........',
@@ -8836,7 +8932,57 @@ function dim(ctx, alpha) {
   ctx.fillRect(0, 0, VIEW_W, Display.viewH);
 }
 
+// The same veil with a hole cut in it: four bands around `r`, so one thing on screen keeps its own
+// brightness while the rest of the frame goes behind an onboarding beat (GDD 8.4).
+//
+// Four fills rather than a composite operation. 'destination-out' would punch through everything
+// already painted, background included, and leave a transparent window onto the page - and the
+// point of the hole is that what shows through it is the scene, undimmed. Drawing around it also
+// keeps the whole thing on the integer grid, which a clipped path would not.
+// Takes one rect or several. Several is what a beat needs when it names a cause and an effect that
+// live in different parts of the screen - a stat on the docket and the meter that stat feeds - and
+// two lit boxes draw the line between them that the three lines of text cannot afford to.
+//
+// The holes must be vertically disjoint, and the walk below is why: it goes down the screen filling
+// the band above each hole, then the strip to its left and right, then continues from its bottom
+// edge. Nothing is ever painted twice, which matters because two overlapping veils at 0.78 would
+// come out near black over the overlap. An overlap does not corrupt the frame - the clamp collapses
+// the offending band to zero height - it just stops being a hole.
+function dimExcept(ctx, alpha, rects) {
+  const holes = (Array.isArray(rects) ? rects : [rects]).filter(Boolean).sort((a, b) => a.y - b.y);
+  if (!holes.length) { dim(ctx, alpha); return; }
+  const h = Display.viewH;
+  ctx.fillStyle = 'rgba(6,5,12,' + alpha + ')';
+  let y = 0;
+  for (const r of holes) {
+    const y0 = clamp(r.y, y, h), y1 = clamp(r.y + r.h, y0, h);
+    const x0 = clamp(r.x, 0, VIEW_W), x1 = clamp(r.x + r.w, x0, VIEW_W);
+    ctx.fillRect(0, y, VIEW_W, y0 - y);
+    ctx.fillRect(0, y0, x0, y1 - y0);
+    ctx.fillRect(x1, y0, VIEW_W - x1, y1 - y0);
+    y = y1;
+  }
+  ctx.fillRect(0, y, VIEW_W, h - y);
+}
+
 // --- HUD (GDD 3) --------------------------------------------------------------
+
+// The Suspicion meter's own geometry, shared by the HUD that draws it and the onboarding beat that
+// points at it. Two copies of `z.y + z.h - 6` is one copy too many the first time the HUD is
+// re-laid out: the spotlight would go on confidently framing the row above the meter.
+function suspicionBar() {
+  const z = Display.zones.hud;
+  return { x: EDGE_MARGIN, y: z.y + z.h - 6, w: VIEW_W - EDGE_MARGIN * 2, h: 4 };
+}
+
+// The whole readout, not just the track: the label, the number on the right and the bar under them
+// are one row and one idea, and a hole cut around the bar alone would leave the word SUSPICION in
+// the dark above a lit stripe.
+function suspicionRowRect() {
+  const bar = suspicionBar();
+  return { x: bar.x, y: bar.y - 10, w: bar.w, h: 10 + bar.h + 1 };
+}
+
 function renderHud(ctx) {
   const z = Display.zones.hud;
   fillRect(ctx, 0, z.y, VIEW_W, z.h, C.hudBg);
@@ -8862,8 +9008,8 @@ function renderHud(ctx) {
   // close", the number answers "how much", and a one-off hit prints its own size between them.
   // Below the amber tier the readout is deliberately grey - a bar that is already red at zero has
   // spent its alarm before anything has gone wrong.
-  const barY = z.y + z.h - 6;
-  const barW = VIEW_W - EDGE_MARGIN * 2;
+  const bar = suspicionBar();
+  const barY = bar.y, barW = bar.w;
   const alarm = state.suspicion >= SUSP_ALARM;
   const tier = alarm ? C.suspicion : (state.suspicion >= SUSP_AMBER ? C.suspAmber : C.inkDim);
 
@@ -9674,6 +9820,32 @@ function drawSoulPortrait(g, soul) {
   if (spr) drawSprite(g, spr, wx + (CARD_WELL.w - GUEST.w) / 2, wy + (CARD_WELL.h - GUEST.h) / 2);
 }
 
+// The screen rect of one stat row, marker through the last pip, for the onboarding beat that points
+// at it (GDD 8.4). Read off the blank's own pip grid rather than written down as a box: the rows
+// have already moved once when the card was re-cut, and a copied constant would have gone on
+// pointing confidently at the wrong number.
+//
+// x starts two pixels left of the coloured marker at column 44 and the width runs to two past the
+// fifth socket, so the row is framed as the player reads it - marker, name, dots, pips - and the
+// vertical rule beside the portrait stays outside the hole. It follows the card's drag offset and
+// its arrival rise for the same reason everything else in this file does: the docket is a physical
+// object on a desk, and a highlight nailed to the rest position would slide off it.
+const CARD_STAT_FOCUS = { x: 42, pad: 2, right: 2 };
+
+function cardStatRect(row) {
+  const card = state.card;
+  if (!card) return null;
+  const rest = cardRect();
+  const pips = SPR_SOUL_CARD.pips;
+  const rise = Math.round((1 - easeOut(card.in)) * 24);
+  return {
+    x: Math.round(rest.x + card.ox) + CARD_STAT_FOCUS.x,
+    y: Math.round(rest.y + card.oy + rise) + pips.rows[row] - CARD_STAT_FOCUS.pad,
+    w: pips.x + (STAT_MAX - 1) * pips.step + pips.size + CARD_STAT_FOCUS.right - CARD_STAT_FOCUS.x,
+    h: pips.size + CARD_STAT_FOCUS.pad * 2
+  };
+}
+
 // A stat is five sockets and the blank has already printed the empty ones, so filling one means
 // painting the inside of a socket that is already on the paper. Nothing here draws an outline: an
 // empty pip is a hole in the form, not a box somebody drew.
@@ -10013,8 +10185,22 @@ function shopPageBeat() {
 // first time. The riot beat is fired from riot() instead, because a riot is an event and by the
 // time it can be seen in the state the guest is already gone.
 function tutorialCheck() {
+  // Ahead of everything else, and on an empty screen. Both hold, and a holding beat stops arrivals
+  // as well as the clock, so the first soul waits until the player has been told what the two
+  // floors are. Asking these of the day rather than of the card is the whole point: they are about
+  // the building, and the building is the one thing on screen before a docket lands on the desk.
+  if (state.day === 1) {
+    tutorialSay('floorHeaven');
+    tutorialSay('floorOps');
+  }
   if (state.card && state.card.in >= 1) {
     tutorialSay('firstCard');
+    // Queued in the same frame as the beat above and read after it. The order is what to do with
+    // the object, then what the numbers on it mean: a player who has not yet been told the docket
+    // is swipeable has no question that SANCTITY is the answer to. All three hold, so the day is
+    // still stopped and the card the last two point at is still on the desk.
+    tutorialSay('statSanctity');
+    tutorialSay('statSkepticism');
     // A full lounge is the moment the second swipe becomes the answer, and a full lounge over a
     // full basement is the moment the third one does. They are the same question twice.
     if (firstFreeSlot(state.heavenSlots) < 0) {
@@ -10174,11 +10360,44 @@ function tutorialPlateY() {
   return Math.max(z.y, Math.min(z.y + 17, slotTop - SPEAKER.h - clear));
 }
 
+// Where a beat is pointing, if it points anywhere. A beat names a target rather than a rectangle,
+// because the rectangle is wherever that target happens to be drawn this frame - the docket the two
+// stat beats point at moves with the finger and rises on arrival.
+//
+// A null here is not an error and is not guarded against elsewhere: it means the thing being talked
+// about is not on screen, and the plate falls back to dimming everything, which is what it did
+// before any beat pointed at anything.
+function tutorialFocusRect() {
+  const beat = TUTORIAL[state.tutorial.id];
+  if (!beat || !beat.focus) return null;
+  if (beat.focus === 'floorHeaven') return heavenFloorRect();
+  if (beat.focus === 'floorOps') return opsFloorRect();
+  if (beat.focus === 'statSanctity') return cardStatRect(0);
+  // Cause and effect, lit together. The line says the red row feeds Suspicion; the meter it feeds
+  // is at the other end of the screen and is the one thing on the HUD the player has no reason to
+  // have looked at yet.
+  if (beat.focus === 'statSkepticism') return [cardStatRect(1), suspicionRowRect()];
+  return null;
+}
+
 function renderTutorial(ctx, y) {
   const t = state.tutorial;
   if (!t.line) return;
   // A held beat dims the scene behind it, so a stopped clock reads as waiting rather than as stuck.
-  if (t.hold) dim(ctx, 0.5);
+  // A beat that points leaves its target out of the veil and dims harder around it: at 0.5 the rest
+  // of the card is still perfectly readable and the eye has no reason to go to the one row being
+  // named, which is the whole of what the beat is for.
+  //
+  // The frame is drawn in the plate's own accent rather than in the stat's colour. Green and red
+  // are what the two rows already say about themselves; a third meaning laid over that would be one
+  // colour too many, whereas gold on both says only "he is pointing here", which is true of both.
+  if (t.hold) {
+    const focus = tutorialFocusRect();
+    dimExcept(ctx, focus ? TUTORIAL_DIM_FOCUS : TUTORIAL_DIM, focus);
+    for (const r of [].concat(focus || [])) {
+      if (r) strokeRect(ctx, r.x - 1, r.y - 1, r.w + 2, r.h + 2, C.credits);
+    }
+  }
   ctx.globalAlpha = tutorialAlpha();
   renderSpeakerPlate(ctx, y === undefined ? tutorialPlateY() : y,
                      t.line, C.credits, t.hold, t.t);
