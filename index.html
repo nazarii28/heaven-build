@@ -342,6 +342,24 @@ const CHEVRON = { w: 7, h: 13 };  // the arrow itself; it sits on a plate, like 
 const CHEVRON_PULSE = 2;          // Hz a red chevron flashes at
 const CHEVRON_PLATE = 3;          // padding between the arrow and the edge of its plate
 
+// The ghost hand that teaches the drag (GDD 3.1). A chevron says WHERE something is and never
+// says HOW to get to it: it is a button, it is tapped, and a player who only ever taps it never
+// finds out that the floor under it moves. So the gesture is demonstrated once, wordlessly, over
+// the row it belongs to, and the player's own first drag is what turns it off for good.
+const HINT_SWEEP = 34;            // px the hand travels, above SWIPE_THRESHOLD so it reads as a real drag
+const HINT_NUDGE = 7;             // px the strip follows it before springing back
+const HINT_HAND_Y = 20;           // fingertip above the ground line: over the guests, clear of their heads
+const HINT_HAND_TIP = 5;          // column of the sprite the fingertip is in
+const HINT_PRESS = 0.35;          // seconds the hand fades in and rests before it moves
+const HINT_TRAVEL = 0.75;         // seconds the sweep takes
+const HINT_LIFT = 0.45;           // seconds it fades out over, and the strip springs back in
+const HINT_GAP = 0.8;             // dead time between two loops
+const HINT_ALPHA = 0.6;           // the hand at its most opaque; it is a ghost, not a sprite
+const HINT_TRAIL = 3;             // dots left behind the fingertip, so the sweep reads as travel
+const HINT_TRAIL_GAP = 6;         // px between them
+const HINT_PLAYS_OPEN = 3;        // loops on the opening burst
+const HINT_PLAYS_ALERT = 2;       // and on the one the first chevron buys
+
 // --- Souls, the queue and the card (GDD 5) ------------------------------------
 const QUEUE_MAX = 8;              // waiting souls; a further arrival turns away (GDD 5.4)
 const FIRST_ARRIVAL = 1.2;        // grace before the first soul of a day
@@ -1161,6 +1179,10 @@ function wrapText(text, maxWidth, px) {
 function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
 function lerp(a, b, t) { return a + (b - a) * t; }
 function easeOut(t) { return 1 - (1 - t) * (1 - t); }
+// Slow at both ends. The ghost hand is the only thing in the game that has to imitate a
+// gesture rather than respond to one, and a hand that starts at full speed reads as a slide
+// rather than as a finger that pressed, moved and let go.
+function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t); }
 
 // One seeded generator for the whole game so a balance run can be replayed exactly.
 let rngState = (RNG_SEED || (Date.now() & 0x7fffffff)) >>> 0;   // seeded from the clock unless RNG_SEED is set
@@ -2380,6 +2402,12 @@ const state = {
   // scratch - a second judge on the same tab must get the same first run as the first one.
   tutorial: { seen: {}, queue: [], id: null, line: null, hold: false, t: 0, life: TUTORIAL_LIFE },
 
+  // The ghost hand that teaches the strip drag (GDD 3.1), and the only lesson in the game with no
+  // words in it. `learned` is its off switch and the player owns it: one horizontal drag on a floor
+  // and the hand never runs again this run. `opened` and `alerted` are the two moments that arm it,
+  // each once. In `state` for the same reason the beats are - PLAY AGAIN has to teach from scratch.
+  stripHint: { learned: false, opened: false, alerted: false, plays: 0, t: 0, dir: -1, base: 0 },
+
   // `denied`, `toOps` and `suspPeak` exist for the verdict on the ending screen (GDD 11) and for
   // nothing else: the title is read off how the run was played, so the run has to have been counted.
   stats: { soulsProcessed: 0, auraTotal: 0, creditsTotal: 0, daysSurvived: 0, riots: 0, processed: 0,
@@ -2467,6 +2495,13 @@ function resetGame() {
   state.tutorial.hold = false;
   state.tutorial.t = 0;
   state.tutorial.life = TUTORIAL_LIFE;
+  state.stripHint.learned = false;
+  state.stripHint.opened = false;
+  state.stripHint.alerted = false;
+  state.stripHint.plays = 0;
+  state.stripHint.t = 0;
+  state.stripHint.dir = -1;
+  state.stripHint.base = 0;
   resetStrips();
   resetFx();
   resetAudio();
@@ -3026,6 +3061,11 @@ function updateStripDrag() {
     stripDrag.locked = true;
     stripDrag.dead = Math.abs(d.dx) <= Math.abs(d.dy);
     if (stripDrag.dead) return;
+    // The ghost hand's off switch, and the only one it has. It fires here rather than off a
+    // scroll, so a drag on the operations floor - which does not scroll at all until a desk is
+    // bought - counts: what the hint teaches is the gesture, not the result of it.
+    state.stripHint.learned = true;
+    state.stripHint.plays = 0;
   }
 
   Strip[kind].t = 1;                     // a finger on the strip outranks an autoscroll in flight
@@ -3044,6 +3084,137 @@ function updateStrips(dt) {
     // shop is not the only thing that can change what a legal scroll is.
     s.scroll = clamp(s.scroll, stripMinScroll(kind), 0);
   }
+  // Last, and deliberately after the clamp: the hint writes the lounge scroll itself, so it has to
+  // be the frame's final word on it.
+  updateStripHint(dt);
+}
+
+// --- The ghost hand (GDD 3.1) -------------------------------------------------
+// The strip is the one object in the game that answers to a gesture nothing on screen asks for.
+// Everything else announces itself: the docket carries three swipe labels, a wreck gets a beat, an
+// expired guest blinks and is tapped. A floor simply sits there being wider than the screen, and
+// the only thing that ever said so was the chevron - which is a button, and is tapped, and so
+// teaches the player that off-screen slots are reached by pressing an arrow rather than by moving
+// the floor. It answers WHERE and it has never once answered HOW.
+//
+// So the gesture is shown instead of described: a translucent hand presses on the slot row, drags,
+// and lets go, and the row follows it a few pixels and springs back. No words, because the
+// Associate's plate stops the day and this is not worth stopping the day for; no arrow, because an
+// arrow is what was already there and already failed.
+const HINT_CYCLE = HINT_PRESS + HINT_TRAVEL + HINT_LIFT + HINT_GAP;
+
+// Two moments arm it, each once per run, and neither of them is a timer.
+//
+// The opening: day one is running, which means the first docket has already been swiped and all
+// three swipe beats have been read, and the row of suites is now the last thing on screen that
+// nobody has said anything about.
+//
+// The first chevron: there is something out past an edge that matters, and the player still has
+// not dragged - which is the only evidence there is that the overhanging fourth suite taught them
+// nothing. This is the one thing the chevron cannot say about itself.
+function checkStripHint() {
+  const h = state.stripHint;
+  if (h.learned || h.plays > 0 || stripMinScroll('heaven') >= 0) return;
+  if (!h.opened) { h.opened = true; h.plays = HINT_PLAYS_OPEN; h.t = 0; return; }
+  if (!h.alerted && (edgeReport('heaven', 1) || edgeReport('heaven', -1))) {
+    h.alerted = true;
+    h.plays = HINT_PLAYS_ALERT;
+    h.t = 0;
+  }
+}
+
+// The hand is only ever on screen while the floor is actually there to be dragged. Anything that
+// takes the floor away - a plate over it, a finger already on it, a chevron autoscroll still
+// landing - takes the hand with it and restarts the loop, rather than freezing it where it stands.
+// A paused hand reads as a stuck animation, and a hint that looks like a bug is worse than none.
+//
+// A finger anywhere ELSE is ignored on purpose. Sorting a docket is a vertical swipe in the work
+// zone, it happens every few seconds all day, and aborting on it would mean a 2.4 s loop that
+// almost never gets to finish. The two cannot be read for each other: one is a hand moving
+// sideways over the suites, the other is a card moving up out of the desk.
+function stripHintReady() {
+  return state.screen === SCREEN.DAY_ACTIVE && !state.dayHold && !tutorialActive()
+         && !stripDrag.kind && Strip.heaven.t >= 1 && stripMinScroll('heaven') < 0;
+}
+
+// Which way a finger would go: towards whichever end of the strip is still out of sight, and
+// towards the edge that has something to say if either has. A hand sweeping away from a live
+// chevron would be two pieces of UI disagreeing about the same floor.
+function stripHintDir() {
+  if (edgeReport('heaven', 1)) return -1;
+  if (edgeReport('heaven', -1)) return 1;
+  return Strip.heaven.scroll > stripMinScroll('heaven') ? -1 : 1;
+}
+
+// 0 to 1 across the sweep, flat outside it at both ends.
+function stripHintTravel(t) {
+  if (t <= HINT_PRESS) return 0;
+  if (t >= HINT_PRESS + HINT_TRAVEL) return 1;
+  return easeInOut((t - HINT_PRESS) / HINT_TRAVEL);
+}
+
+// What the strip is offset by while the hand is on it. It follows for the length of the sweep and
+// is let go over the lift, which is the whole sentence: the floor moved because the finger moved,
+// and it is back where it started, so nothing has been decided and nothing is off screen that was
+// not off screen before. Seven pixels against a 40 px suite - enough to see, far too little to
+// move a tap off the guest it was aimed at.
+function stripHintNudge(h) {
+  const end = HINT_PRESS + HINT_TRAVEL;
+  if (h.t < HINT_PRESS) return 0;
+  if (h.t < end) return HINT_NUDGE * h.dir * stripHintTravel(h.t);
+  if (h.t < end + HINT_LIFT) return HINT_NUDGE * h.dir * (1 - easeOut((h.t - end) / HINT_LIFT));
+  return 0;
+}
+
+function stripHintAlpha(h) {
+  const end = HINT_PRESS + HINT_TRAVEL;
+  if (h.t < HINT_PRESS) return HINT_ALPHA * (h.t / HINT_PRESS);
+  if (h.t < end) return HINT_ALPHA;
+  if (h.t < end + HINT_LIFT) return HINT_ALPHA * (1 - (h.t - end) / HINT_LIFT);
+  return 0;
+}
+
+// Where the fingertip is this frame. The sweep is centred on the view, so it stays on screen
+// whichever way it is going and lands over the middle suites rather than over an edge.
+function stripHintHand(h) {
+  return {
+    x: VIEW_W / 2 + h.dir * HINT_SWEEP * (stripHintTravel(h.t) - 0.5),
+    y: Display.zones.ground.y - HINT_HAND_Y,
+    travel: stripHintTravel(h.t)
+  };
+}
+
+// The renderer asks this rather than reading `plays`: a burst that is armed and waiting for a plate
+// to clear has plays left and nothing to draw.
+function stripHintLive() {
+  const h = state.stripHint;
+  return h.plays > 0 && h.t > 0 && stripHintReady();
+}
+
+function updateStripHint(dt) {
+  const h = state.stripHint;
+  checkStripHint();
+  if (h.plays <= 0) return;
+  if (!stripHintReady()) {
+    // Interrupted mid-loop. The strip is handed back through the same autoscroll a chevron tap
+    // uses, so the two can never be writing to `scroll` in the same frame - except when a finger
+    // is already on the floor, which outranks both and keeps the strip exactly where it landed.
+    // Snapping it home under a thumb that has just come down is the one wrong answer here.
+    if (h.t > 0) {
+      if (!stripDrag.kind) scrollStripTo('heaven', h.base);
+      h.t = 0;
+    }
+    return;
+  }
+  // Read at the top of each loop rather than of each burst, so a chevron tap between two loops is
+  // respected: the hand starts from wherever the player left the floor.
+  if (h.t === 0) {
+    h.base = Strip.heaven.scroll;
+    h.dir = stripHintDir();
+  }
+  h.t += dt;
+  if (h.t >= HINT_CYCLE) { h.t = 0; h.plays--; return; }
+  Strip.heaven.scroll = clamp(h.base + stripHintNudge(h), stripMinScroll('heaven'), 0);
 }
 
 function expiredGuestCount() {
@@ -6285,6 +6456,128 @@ const SPR_QUEUE_SOUL = {
     ],
   ]
 };
+// SPR_HINT_HAND  11x15  anchor 5,0  1 frame(s)
+// The ghost hand that demonstrates the strip drag (GDD 3.1). Drawn at low alpha over the lounge,
+// so it lands on white cloud, on a violet guest and on the dark mouth of a niche within one sweep -
+// which is the same problem the lock has, and it is solved the same way: a dark contour around a
+// light face, so neither half of it can be swallowed by what is behind it.
+//
+// The anchor is the FINGERTIP rather than the feet, because that is the only point of the drawing
+// the game positions from: the tip is what is notionally touching the glass, and the sweep is
+// measured along it. Column 5 of row 0, which is what HINT_HAND_TIP repeats for the renderer.
+// legend, darkest first:
+//   x = outline     #16131f  luma  21
+//   s = cloudShade  #d8e2ee  luma 225
+//   c = cloud       #f2f4f8  luma 243
+//   . = transparent
+const SPR_HINT_HAND = {
+  key: 'hintHand',
+  w: 11, h: 15, anchor: [5, 0],
+  pal: { x: 'outline', s: 'cloudShade', c: 'cloud' },
+  frames: [
+    [
+      '....xx.....',   // 0  fingertip
+      '...xccx....',
+      '...xccx....',
+      '...xccx....',
+      '...xccx....',
+      '...xccx....',   // 5
+      '..xxccxxx..',   //    knuckles: the finger runs on into the fist
+      '..xccccccx.',
+      '.xxccccccx.',
+      'xccccccccx.',   //    the thumb, hanging off the left
+      'xccccccccx.',   // 10
+      '.xccccccsx.',
+      '.xccccsssx.',
+      '..xsssssx..',
+      '..xxxxxxx..',
+    ],
+  ]
+};
+// SPR_SUITE_CLOSED  40x48  anchor 20,48  1 frame(s)
+// The suite the Renovation contract shuts for the day (GDD 8.3). A striped plank on two splayed
+// legs, standing in the doorway of the niche - the scaffolding the contract card promises is
+// already in the corridor.
+//
+// Deliberately the lock's three colours and no others. The game has two different sentences about
+// a suite that cannot be filled - "you have not bought this one" and "this one is shut today" -
+// and they are different sentences in the same voice: both are hardware, neither is an alarm. That
+// is why nothing here is red or amber. Red is a wreck and amber is the meter, and a maintenance
+// closure is neither a failure nor a warning; it is a thing the player agreed to last night and
+// can do nothing about today.
+//
+// It occupies the bottom third and no more. An occupied suite keeps its guest and keeps paying
+// while it is shut, so the plank starts below the waist and the face, the body and the halo above
+// it are left alone.
+//
+// The stripes are steel against cloudShade and not outline against cloudShade, which was the first
+// pass. Near-black on near-white made the plank the highest-contrast object anywhere on the screen,
+// louder than a guest, a halo or the Suspicion bar - and a state the player agreed to last night
+// and cannot act on today has no business being the loudest thing in the frame (GDD 9.4). The dark
+// is spent on the border and the legs, where it buys the silhouette, and the pattern inside is a
+// quieter pair that still reads as stripes.
+// legend, darkest first:
+//   x = outline     #16131f  luma  21
+//   E = steel       #8e91a8  luma 146
+//   c = cloudShade  #d8e2ee  luma 225
+//   . = transparent
+const SPR_SUITE_CLOSED = {
+  key: 'suiteClosed',
+  w: 40, h: 48, anchor: [20, 48],
+  pal: { x: 'outline', E: 'steel', c: 'cloudShade' },
+  frames: [
+    [
+      '........................................',   // 0
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',   // 5
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',   // 10
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',   // 15
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',   // 20
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',
+      '........................................',   // 25
+      '........................................',
+      '........................................',
+      '....xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx....',
+      '....xcEEEEccccEEEEccccEEEEccccEEEEcx....',
+      '....xEEEccccEEEEccccEEEEccccEEEEcccx....',   // 30
+      '....xEccccEEEEccccEEEEccccEEEEccccEx....',
+      '....xcccEEEEccccEEEEccccEEEEccccEEEx....',
+      '....xcEEEEccccEEEEccccEEEEccccEEEEcx....',
+      '....xEEEccccEEEEccccEEEEccccEEEEcccx....',
+      '....xEccccEEEEccccEEEEccccEEEEccccEx....',   // 35
+      '....xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx....',
+      '........xEx..................xEx........',
+      '........xEx..................xEx........',
+      '.......xEx....................xEx.......',
+      '.......xEx....................xEx.......',   // 40
+      '.......xEx....................xEx.......',
+      '......xEx......................xEx......',
+      '......xEx......................xEx......',
+      '......xEx......................xEx......',
+      '........................................',   // 45
+      '........................................',
+      '........................................',
+    ],
+  ]
+};
 
 // ==========================================================================
 // 15d_art_shop.js
@@ -8764,6 +9057,41 @@ function drawChevron(ctx, r, side, color) {
   }
 }
 
+// The ghost hand that teaches the drag (11_floors.js). Drawn over everything on the floors and
+// under the chevrons, which is the order the two are read in: the arrow is the alarm and must never
+// be covered, and the hand is the answer to the question the arrow leaves open.
+//
+// A hand on its own reads as "tap here" - a still pointer over a still row is a target, not a
+// gesture. What makes it a drag is that it has come from somewhere, so the fingertip leaves a short
+// wake along the path it has already covered, thinning towards the start. Dashes rather than dots:
+// a square is a point and points do not have a direction, and the first version of this was two
+// faint specks beside the hand that read as dither in the cloud. They stop at the start of the
+// sweep rather than fading forever, because a tail longer than the gesture would be a line under
+// the row, and a line under the row is a different piece of UI making a different promise.
+//
+// Drawn in the outline colour and not in the hand's own warm white, which is the second thing that
+// made the first version invisible: the wake lives entirely on pale cloud, and half-transparent
+// warm white on pale cloud is pale cloud. The hand gets away with white because it carries a dark
+// contour; a one-pixel dash has no room for one, so it has to BE the dark part.
+function renderStripHint(ctx) {
+  if (!stripHintLive()) return;
+  const h = state.stripHint;
+  const a = stripHintAlpha(h);
+  if (a <= 0) return;
+  const p = stripHintHand(h);
+
+  for (let i = 1; i <= HINT_TRAIL; i++) {
+    const back = i * HINT_TRAIL_GAP;
+    if (back > HINT_SWEEP * p.travel) break;
+    ctx.globalAlpha = a * (1 - i / (HINT_TRAIL + 1));
+    fillRect(ctx, p.x - h.dir * back - 1, p.y + 1, 3, 1, C.outline);
+  }
+
+  ctx.globalAlpha = a;
+  drawSprite(ctx, SPR_HINT_HAND, p.x - HINT_HAND_TIP, p.y);
+  ctx.globalAlpha = 1;
+}
+
 // Red means an expired contract is out there and how many; white means a free slot is out there
 // and something is waiting for it. Red flashes because it is the one that costs the player a slot
 // if it is ignored, and both are drawn last of everything in the scene so nothing can cover them.
@@ -8839,6 +9167,20 @@ function renderScene(ctx) {
               slot.guest.soul);
   }
 
+  // The suite the Renovation contract shut for the day (GDD 8.3). It had no drawing at all until
+  // now: a slot with `maint` set was rendered as an ordinary empty suite, so the one contract in
+  // the deck that takes something away took it away invisibly, and the player was left to work out
+  // from a refused swipe that a suite they could see was not a suite they could use.
+  //
+  // In front of whoever is still standing in the room, because a barrier behind the person it is
+  // barring is not a barrier, and behind the cloud lip, so the lip tucks its legs in the way it
+  // tucks in a guest's feet. Both of those are why it is drawn here and not with the outlines.
+  for (let i = 0; i < hCount; i++) {
+    if (!state.heavenSlots[i].maint) continue;
+    const r = heavenSlotRect(i);
+    drawSprite(ctx, SPR_SUITE_CLOSED, r.x, r.y);
+  }
+
   ctx.drawImage(cloudFront, cloudX + scroll, 0);
   renderAttractions(ctx);
   renderSuspicionWash(ctx);
@@ -8884,11 +9226,19 @@ function renderScene(ctx) {
       // An armed Contract Termination (GDD 9.1) turns the question round: for as long as it is
       // waiting, the OCCUPIED suites are the targets, so they are the ones outlined.
       strokeRect(ctx, r.x, r.y, r.w, r.h, C.suspicion);
-    } else if (!slot.guest) {
+    } else if (!slot.guest && !slot.maint) {
       // A live swipe upwards lights the slots it could land in, so the target of the gesture is
       // visible before the finger is lifted. Otherwise: an empty slot with souls waiting blinks,
       // because that pair of facts is the definition of falling behind (GDD 10). It blinks at the
       // same 1 Hz as the Suspicion bar on purpose - the game has one alarm rhythm, not three.
+      //
+      // A suite shut for maintenance is excluded from both, and it was in neither before. Both
+      // were lies about it and the second was the worse one: `firstFreeSlot` skips a `maint` slot,
+      // so the cyan outline offered a landing the swipe could never make, and the ink blink is the
+      // game's own alarm for a free slot going to waste while souls queue - fired at the player
+      // over a slot they had already agreed to lose and could do nothing about. The barrier drawn
+      // in the doorway is the whole statement; saying it a second time in an outline would be
+      // spending an attention channel on a fact with no action attached to it (GDD 9.4).
       const idle = state.queue.length > 0 && Math.sin(Fx.time * Math.PI * 2 * SUSP_ALARM_PULSE) > 0;
       if (dir === 'up') dashedRect(ctx, r.x, r.y, r.w, r.h, C.aura, 3, 3, 0);
       else if (idle) dashedRect(ctx, r.x, r.y, r.w, r.h, C.ink, 3, 3, 0);
@@ -8957,8 +9307,12 @@ function renderScene(ctx) {
   renderQueue(ctx);
 
   // Only during a day: between days the floors are not being managed, and a chevron over the
-  // shop panel would be pointing at something the player cannot act on.
-  if (state.screen === SCREEN.DAY_ACTIVE) renderChevrons(ctx);
+  // shop panel would be pointing at something the player cannot act on. The ghost hand keeps the
+  // same company and goes under, so the arrow it is explaining stays the topmost thing on screen.
+  if (state.screen === SCREEN.DAY_ACTIVE) {
+    renderStripHint(ctx);
+    renderChevrons(ctx);
+  }
 
   fillRect(ctx, 0, z.work.y, VIEW_W, z.work.h, C.bgDeep);
   fillRect(ctx, 0, z.work.y, VIEW_W, 2, C.panel);
