@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#100e18">
+<!-- Only fires when the page has been added to the home screen, where iOS drops the address bar
+     and the toolbar and hands the page the whole display. It does nothing in an ordinary Safari
+     tab, and nothing at all anywhere else, which is why it is two lines rather than a decision:
+     there is no API that hides Safari's chrome, so this is the only route to a full screen on an
+     iPhone and it costs nothing to leave open. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Heaven">
 <link rel="icon" href="data:,">
 <title>Welcome to Heaven</title>
 <style>
@@ -47,7 +55,20 @@ const RNG_SEED = 0;               // 0 = seed from the clock, any other value = 
 
 // --- Virtual screen (GDD 1.2) -------------------------------------------------
 const VIEW_W = 216;               // fixed virtual width, everything is authored against it
-const VIEW_H_MIN = 384;           // shortest supported view; all layout must fit here
+// The layout is AUTHORED at 384 (ZONE_H below) and that has not changed. What changed on
+// 5 September is the shortest view it is allowed to be squeezed into, and the reason is iOS.
+//
+// Safari's own chrome - address bar above, toolbar below - cannot be hidden from a normal tab by
+// any API, and on three of six iPhone profiles it costs exactly one integer scale step. Measured:
+// an iPhone XR at 414x715 CSS gets x3 and 45 CSS px of black down each side, a fifth of the width;
+// the same phone with no chrome gets x4 and fills it. The blocker is not the width - 216x4 = 864
+// against 828 physical px is inside CROP_TOLERANCE - it is this constant, because floor(1430/4) is
+// 357 rows and the crop test refused anything under 384.
+//
+// So 357, which is what that phone actually offers, and which also unlocks the step on an SE
+// (80 px of bar down to 26) and on both Pro Maxes. Below 384 every zone gives rows back by
+// ZONE_SHRINK; nothing about the 384 layout moved.
+const VIEW_H_MIN = 357;           // shortest supported view, see ZONE_SHRINK
 const VIEW_H_MAX = 480;           // tallest supported view, 20:9 phones
 const CROP_TOLERANCE = 1.045;     // allow the next integer scale to overflow width by this factor
 const EDGE_MARGIN = 6;            // nothing interactive closer than this to a canvas edge
@@ -298,7 +319,15 @@ const CLOUD_RIM_LIFT = 0.22;      // how far back up the body ramp that edge is 
 // --- Zone layout (GDD 3). Heights are given for the 384 px view; the extra
 // rows of a taller view are handed out with the weights below.
 const ZONE_BASE = { hud: 40, heaven: 116, ground: 8, ops: 80, work: 140 };
+const ZONE_H = 384;               // what ZONE_BASE sums to: the height the layout is authored at
 const ZONE_GROW = { hud: 6, heaven: 38, ground: 0, ops: 26, work: 26 };  // sums to 96 = 480 - 384
+// And the other direction, for the views shorter than the layout was authored for (VIEW_H_MIN).
+// The HUD is not on this list and cannot be: its four rows are drawn at fixed offsets - the clock
+// at +4, the two currencies at +15, the Suspicion label at h-15 and its bar at h-6 - so at 38 rows
+// the label lands on top of the currencies. It is the one zone in the game with no slack at all.
+// The ground line does not shrink for the same reason it does not grow: it is eight rows of
+// horizon and there is nothing in it to give.
+const ZONE_SHRINK = { hud: 0, heaven: 38, ground: 0, ops: 26, work: 26 };
 
 // --- Slots (GDD 3) ------------------------------------------------------------
 const HEAVEN_SLOT = { w: 40, h: 48, gap: 18 };  // gap widened from 5: a cloud pillar has to fit between two slots
@@ -1338,17 +1367,25 @@ function resizeDisplay() {
   ctx.imageSmoothingEnabled = false;
 }
 
-// Zone heights are authored for the 384 px view; a taller view hands the extra rows out by weight.
+// Zone heights are authored for the 384 px view; a taller view hands the extra rows out by weight,
+// and a shorter one takes them back the same way.
+//
+// `extra` is measured from ZONE_H and not from VIEW_H_MIN, which is the whole of what let the
+// minimum move without touching a single number in the layout: the distance from the authored
+// height is what the weights are about, and VIEW_H_MIN is only the shortest view the scale picker
+// will accept. They were the same number until 5 September and reading one for the other would
+// have quietly redistributed the tall-phone layout the moment they stopped being.
 function computeZones(viewH) {
-  const extra = viewH - VIEW_H_MIN;
+  const extra = viewH - ZONE_H;
+  const weights = extra < 0 ? ZONE_SHRINK : ZONE_GROW;
   let growTotal = 0;
-  for (const k in ZONE_GROW) growTotal += ZONE_GROW[k];
+  for (const k in weights) growTotal += weights[k];
 
   const order = ['hud', 'heaven', 'ground', 'ops', 'work'];
   const h = {};
   let used = 0;
   for (const k of order) {
-    h[k] = ZONE_BASE[k] + Math.floor(extra * ZONE_GROW[k] / growTotal);
+    h[k] = ZONE_BASE[k] + Math.floor(extra * weights[k] / growTotal);
     used += h[k];
   }
   h.work += viewH - used;          // the work zone absorbs the rounding remainder
