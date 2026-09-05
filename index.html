@@ -2005,6 +2005,14 @@ const SPEAKER_NAME = 'YOUR ONBOARDING SPECIALIST';
 // same as "day one only", and it cannot be - a contract runs 90 seconds and day one is 55, so the
 // first expiry always lands on day two, and the beat teaching the second half of the core loop
 // would have been the one beat nobody was ever made to read.
+//
+// `riot` is the one exception, and it is an exception to the rule's UNIT rather than to the rule.
+// It reports a fact, and it is the first half of a two-part gate whose second half asks for the
+// hardest gesture in the game: what a riot sounds like, and then what to do about what it left
+// behind. Every riot wrecks a suite - `riot()` sets `wrecked` unconditionally - so the pair is
+// guaranteed and is really one beat delivered in two plates. Leaving the first half unheld put
+// five seconds of ordinary sorting between the cause and the instruction, which is exactly long
+// enough for them to arrive as two unrelated events.
 const TUTORIAL = {
   // The geography, before there is anything to do with it. These two are the only beats in the game
   // that fire on an empty screen: they are queued in the first frame of day one, they hold, and a
@@ -2053,9 +2061,16 @@ const TUTORIAL = {
   // would lead them to try it. Two sentences: what the wreck costs, then the gesture - in that
   // order, because the player has just watched the wreck happen and wants to know what it means
   // before being told what to do about it.
-  repair:    { hold: true, life: TUTORIAL_LIFE_LONG,
+  // The one beat in the game that is not dismissed by a tap (GDD 6.5). `act` names what it is
+  // waiting for in TUTORIAL_ACTS below; until that has happened the day stays stopped, the suite
+  // stays lit and the plate stays up. It holds like the swipe beats and for the same reason - the
+  // repair is the only gesture in the game that is neither a tap nor a swipe - but a tap was not
+  // enough, and the playtest is what said so: people read the line, tapped it away and went on
+  // sorting with a dead suite in the row, because a sentence you can dismiss without doing
+  // anything is a sentence about a mechanic you do not have.
+  repair:    { hold: true, act: 'repair', focus: 'wreck', life: TUTORIAL_LIFE_LONG,
     text: 'That suite is out of service and Head Office can see it. Hold it to put it back.' },
-  riot:      { hold: false, text: 'That is what an unhandled expiry sounds like. Upstairs can hear it.' },
+  riot:      { hold: true,  text: 'That is what an unhandled expiry sounds like. Upstairs can hear it.' },
   // What "nobody stays" turns out to mean, paid off the first time a desk clears itself. The beat
   // is deliberately not on day one with the floors: at the opening there is nothing downstairs and
   // nothing has gone anywhere, so "further down" answers a question the player has not been given
@@ -2099,6 +2114,20 @@ const TUTORIAL = {
     text: 'Amenities. Each one brings people in, and each one is visible from the road.' },
   tabStaff:    { hold: true, shop: true,
     text: 'One associate. Free to hire, and paid out of every settlement after that.' }
+};
+
+// What an acting beat is waiting for, and what its plate prints in the corner while it waits.
+// One entry, because there is one such beat - a map rather than a branch so that the next one is
+// data, and so tools/check.mjs can measure the label against the plate the way it measures every
+// other string in this file.
+//
+// `done` is a condition on the world and not a flag set by the gesture, which is the same rule the
+// beats themselves follow. It is also what makes the gate impossible to strand a run on: the wreck
+// being gone ends it, however it went. The repair itself is clamped at zero Credits rather than
+// refused (REPAIR_COST), so there is no state of the game in which the player cannot pay their way
+// out of this plate.
+const TUTORIAL_ACTS = {
+  repair: { label: 'HOLD THE SUITE', done: function () { return firstWreckedSlot() < 0; } }
 };
 
 // Shown when the device is held sideways. In tone, but it still has to be an instruction.
@@ -3201,7 +3230,12 @@ function updateStripHint(dt) {
     // is already on the floor, which outranks both and keeps the strip exactly where it landed.
     // Snapping it home under a thumb that has just come down is the one wrong answer here.
     if (h.t > 0) {
-      if (!stripDrag.kind) scrollStripTo('heaven', h.base);
+      // An autoscroll already in flight owns the strip and is going somewhere the hint knows
+      // nothing about - a chevron the player tapped, or the suite an acting beat has just centred.
+      // Handing the strip back to a base captured before either of those would drag it off the
+      // thing it was sent to, which on the onboarding gate means dragging the spotlight's own
+      // subject back off the screen. Seven pixels of un-restored nudge is the cheaper wrong.
+      if (!stripDrag.kind && Strip.heaven.t >= 1) scrollStripTo('heaven', h.base);
       h.t = 0;
     }
     return;
@@ -3221,6 +3255,14 @@ function expiredGuestCount() {
   let n = 0;
   for (const s of state.heavenSlots) if (s.guest && s.guest.expired) n++;
   return n;
+}
+
+// The wreck nearest the left end, or -1. Both callers want a slot rather than a count: the
+// onboarding gate points a spotlight at one and scrolls it into reach, and the condition that ends
+// the gate is this returning -1.
+function firstWreckedSlot() {
+  for (let i = 0; i < state.heavenSlots.length; i++) if (state.heavenSlots[i].wrecked) return i;
+  return -1;
 }
 
 // Half a slot on screen still counts as on screen: the guest inside it is centred, so it is fully
@@ -3374,8 +3416,12 @@ function servableSlot(i) {
   return !!slot && slot.unlocked && slot.wrecked;
 }
 
+// A holding beat normally takes every gesture off the player, and the onboarding gate is the one
+// exception in the game: it is a holding beat whose entire purpose is to be answered by this
+// gesture, so refusing the gesture while it is up would be a lock with no key.
 function serviceReady() {
-  return state.screen === SCREEN.DAY_ACTIVE && !state.dayHold && !tutorialHolding();
+  return state.screen === SCREEN.DAY_ACTIVE && !state.dayHold
+         && (!tutorialHolding() || tutorialActing());
 }
 
 
@@ -3456,22 +3502,35 @@ function serviceHoldOn(i) {
 
 // A tap on an expired guest sends it downstairs. A tap on a working one gets a shrug: there is no
 // early eviction in this game, and planning the buffer downstairs ahead of time is the strategy.
+// A tap on a wreck answers instead of falling through to nothing. This is the whole of the
+// gesture's discoverability: the player who has just watched a guest tear a suite up will tap it,
+// and a tap that does nothing at all teaches that the suite is scenery. A shake and the same
+// refusal note the game already uses says "not like that" - and the hold ring that starts filling
+// the moment the finger stays says the rest without a word.
+//
+// Its own function because the onboarding gate wants this answer and nothing else in this file:
+// while the gate is up a tap must not relocate a guest, arm anything or scroll, and it must not
+// put the plate away either - the only thing left for it to say is "not like that".
+function tapWreck(g) {
+  const count = visibleSlotCount(state.heavenSlots);
+  for (let i = 0; i < count; i++) {
+    const slot = state.heavenSlots[i];
+    if (slot.guest || !slot.wrecked) continue;
+    if (!pointInRect(g.x, g.y, heavenSlotRect(i))) continue;
+    addShake(2, 0.12);
+    sfx('busy');
+    return true;
+  }
+  return false;
+}
+
 function handleSlotTap(g) {
   if (serviceHold.consume) { serviceHold.consume = false; return true; }
+  if (tapWreck(g)) return true;
 
   const count = visibleSlotCount(state.heavenSlots);
   for (let i = 0; i < count; i++) {
     const slot = state.heavenSlots[i];
-    // A tap on a wreck answers instead of falling through to nothing. This is the whole of the
-    // gesture's discoverability: the player who has just watched a guest tear a suite up will tap
-    // it, and a tap that does nothing at all teaches that the suite is scenery. A shake and the
-    // same refusal note the game already uses says "not like that" - and the hold ring that starts
-    // filling the moment the finger stays says the rest without a word.
-    if (!slot.guest && slot.wrecked && pointInRect(g.x, g.y, heavenSlotRect(i))) {
-      addShake(2, 0.12);
-      sfx('busy');
-      return true;
-    }
     if (!slot.guest) continue;
     if (!pointInRect(g.x, g.y, heavenSlotRect(i))) continue;
 
@@ -4552,6 +4611,12 @@ function updateGame(dt) {
       // during that hold, off the card it is talking about.
       tutorialCheck();
       updateTutorial(dt);
+      // The onboarding gate (GDD 6.5, 8.4). It stops the day exactly as any other holding beat
+      // does - no clock, no arrivals, no contracts, no production - and then hands back the two
+      // systems the gesture it is waiting for cannot do without: the strip, so the suite under the
+      // spotlight can be reached and so the autoscroll that centred it lands, and the hold itself,
+      // which is the only way out of the plate.
+      if (tutorialActing()) { updateStrips(dt); updateServiceHold(dt); break; }
       if (state.tutorial.hold) break;
 
       // The held first day: the clock, the drip and the floors all wait, and arrivals run only
@@ -4644,6 +4709,13 @@ function handleGesture(g) {
       break;
 
     case SCREEN.DAY_ACTIVE:
+      // The gate is asked about first, because it is a holding beat that must NOT be dismissed by
+      // the line below: it is waiting for a gesture named in its own text and a tap is not that
+      // gesture. The one tap it answers is a tap on the suite it is pointing at, which gets the
+      // same "not like that" shake a wreck has always given - the answer that sends the finger
+      // back down to rest instead of away.
+      if (tutorialActing()) { if (g.type === 'tap') tapWreck(g); break; }
+
       // A holding beat eats whatever gesture dismisses it, swipes included. Letting one through
       // would file the soul the beat is still explaining, which is the single outcome that makes
       // the lesson worthless - and it costs the player one flick, once in a run.
@@ -10652,6 +10724,18 @@ function tutorialActive() { return state.tutorial.line !== null; }
 // has to tap it away like a player would.
 function tutorialHolding() { return tutorialActive() && state.tutorial.hold; }
 
+// The acting beat on the plate, or null: a beat that waits for a gesture instead of for a tap
+// (TUTORIAL_ACTS in 08_data.js). Worth a named predicate rather than an inline field read because
+// four places outside this file ask the question - the state machine, to decide what still runs
+// behind the plate; the gesture handler, to decide that a tap is not the answer; the repair
+// gesture, to let itself through a holding beat; and the plate, to print the right instruction.
+function tutorialAct() {
+  const beat = TUTORIAL[state.tutorial.id];
+  return (state.tutorial.line && beat && beat.act) ? TUTORIAL_ACTS[beat.act] : null;
+}
+
+function tutorialActing() { return !!tutorialAct(); }
+
 // Queued rather than shown: two beats can become true in the same frame - the quota clock and a
 // lounge that just filled - and the second one would otherwise overwrite the first before it had
 // been read. Marking it seen at the moment it is queued is what keeps it to once per run.
@@ -10791,12 +10875,24 @@ function updateTutorial(dt) {
     t.id = id;
     t.line = beat.text;
     t.hold = beat.hold;
+    // A beat that will not go away until a suite has been dealt with has to be able to reach that
+    // suite. A riot can wreck one that is off the end of a scrolled strip, and a gate demanding a
+    // gesture on something the player cannot see is not a gate, it is a lock with no key. Centred
+    // through the same autoscroll a chevron tap uses, so there is one way a strip ever moves on
+    // its own.
+    if (beat.act === 'repair' && firstWreckedSlot() >= 0) scrollStripToSlot('heaven', firstWreckedSlot());
     // A beat that tells a story rather than an instruction is given longer to be read: three lines
     // at the arrival rate of day eight are not five seconds of reading.
     t.life = beat.life || TUTORIAL_LIFE;
     t.t = 0;
   }
   if (!t.line) return;
+  // An acting beat is dismissed by the world changing and never by input: the condition that ends
+  // it is the thing it asked for, checked every frame, which is the rule every beat in this file
+  // is fired by read backwards. It is also why the gate cannot strand a run - the moment the wreck
+  // is gone the plate is gone, whatever made it so.
+  const act = tutorialAct();
+  if (act && act.done()) { tutorialDismiss(); return; }
   t.t += dt;
   if (!t.hold && t.t >= t.life) tutorialDismiss();
 }
@@ -10877,7 +10973,14 @@ function renderSpeakerPlate(ctx, y, text, accent, waiting, talkT) {
   }
   // Only a beat that stopped the clock says this, and it says it inside the plate: the row below
   // the plate is the top of the lounge slots, where the halos are.
-  if (waiting) drawTextRight(ctx, 'TAP TO CONTINUE', x + w - SPEAKER.pad, y + 41, C.credits, 1);
+  //
+  // `waiting` is `true` for a beat that a tap puts away, or the instruction an acting beat is
+  // waiting on. Two different sentences in one corner, because a gate that prints TAP TO CONTINUE
+  // while refusing to be tapped away is worse than a gate that prints nothing at all.
+  if (waiting) {
+    drawTextRight(ctx, waiting === true ? 'TAP TO CONTINUE' : waiting,
+                  x + w - SPEAKER.pad, y + 41, C.credits, 1);
+  }
 }
 
 // Parked in the sky, under the queue row and above the lounge slots. The GDD drew it at the bottom
@@ -10923,6 +11026,12 @@ function tutorialFocusRect() {
   // is at the other end of the screen and is the one thing on the HUD the player has no reason to
   // have looked at yet.
   if (beat.focus === 'statSkepticism') return [cardStatRect(1), suspicionRowRect()];
+  // The suite the gate is about. Read every frame off the slot rather than remembered, like every
+  // other target here, so it follows the strip if the player drags it while the plate is up.
+  if (beat.focus === 'wreck') {
+    const i = firstWreckedSlot();
+    return i < 0 ? null : heavenSlotRect(i);
+  }
   return null;
 }
 
@@ -10945,8 +11054,9 @@ function renderTutorial(ctx, y) {
     }
   }
   ctx.globalAlpha = tutorialAlpha();
+  const act = tutorialAct();
   renderSpeakerPlate(ctx, y === undefined ? tutorialPlateY() : y,
-                     t.line, C.credits, t.hold, t.t);
+                     t.line, C.credits, act ? act.label : t.hold, t.t);
   ctx.globalAlpha = 1;
 }
 
