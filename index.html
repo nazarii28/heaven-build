@@ -1284,6 +1284,25 @@ function hitRect(r) {
   return { x: r.x + (r.w - w) / 2, y: r.y + (r.h - h) / 2, w: w, h: h };
 }
 
+// The iOS audio session, and the only lever a page has over it. WebKit opens Web Audio on the
+// system's default session, which is the short-buffer one meant for interface blips; a page that
+// declares itself a media player gets the media session instead - a wider output buffer, and media
+// elements that are not throttled for looking unattended. Called before the AudioContext is built,
+// because the session is chosen when the context opens.
+//
+// `navigator.audioSession` is WebKit's and nowhere else's, so the return value doubles as the
+// engine test both audio files use to decide which `latencyHint` will be understood.
+//
+// The side effect is deliberate and worth naming: 'playback' means the ringer switch no longer
+// silences the game. That is what a media player does, the game has its own mute button, and the
+// alternative is the output buffer that crackles.
+function claimPlaybackAudioSession() {
+  const s = navigator.audioSession;
+  if (!s) return false;
+  try { s.type = 'playback'; } catch (e) {}
+  return true;
+}
+
 // ==========================================================================
 // 05_display.js
 // ==========================================================================
@@ -11172,18 +11191,21 @@ const OUT_LATENCY = 2048 / 48000;
 // one decode underrun on a phone is a permanent offset, and an offset between two arrangements of
 // the same bars is a flam on every hit they share.
 //
-// So the leader is stem 0 and the other two are pulled to it. Under DRIFT_DEAD nothing happens -
-// `currentTime` on a media element is not reported finely enough for corrections that small to be
-// anything but noise. Between there and DRIFT_HARD the correction is a playbackRate nudge, capped
-// at DRIFT_RATE; 0.3 % is about five cents, which is inaudible on one layer of three and takes
-// under seven seconds to absorb the largest drift it is allowed to see. Past DRIFT_HARD the stem
-// is too far out to walk back and gets a seek, which is a click if it is audible - so an audible
-// stem is only ever seeked as a last resort, and a silent one is always seeked, because on a
-// stem nobody can hear a seek costs nothing.
+// The rule is that a stem anybody can hear is never touched - not seeked, not resampled. See
+// checkDrift for why that is necessary on WebKit and affordable everywhere. Corrections are seeks
+// and they happen while a stem is out of the mix: DRIFT_DEAD is the offset below which one is not
+// worth making, DRIFT_HARD the one above which a stem audible ALONGSIDE another is dropped from
+// the mix rather than layered out of step.
+//
+// SEEK_COOL is what stops a slow seek being stacked on itself. Setting `currentTime` takes
+// hundreds of milliseconds on an iPhone, and a watchdog that re-fires inside that window is the
+// non-convergence this section was rewritten to remove.
 const DRIFT_MS   = 2000;     // how often the check runs
 const DRIFT_DEAD = .015;
 const DRIFT_HARD = .120;
-const DRIFT_RATE = .003;
+const SEEK_COOL  = 5000;     // ms a stem is left alone once a seek has been asked for
+const SEEK_TRIES = 3;        // corrective seeks in one attempt before the offset is accepted
+const HEARD_GAIN = .002;     // bus gain, -54 dB, under which a stem is not in the room
 
 // How long the silence probe may wait for a mix worth judging, in 250 ms ticks. Two minutes.
 const SILENCE_CAP = 480;
@@ -11273,7 +11295,17 @@ function fail(why) {
 function initAudio() {
   if (AC) return;
   const Ctor = window.AudioContext || window.webkitAudioContext;
-  try { AC = new Ctor({ latencyHint: OUT_LATENCY }); }
+  // Before the context, because the session is chosen when the context opens. It answers true only
+  // on WebKit, which is also the answer to the next question.
+  const webkit = claimPlaybackAudioSession();
+  // WebKit does not honour a latency in seconds. An iPhone asked for OUT_LATENCY hands back 128
+  // frames - 2.7 ms for the audio thread to mix three streaming decoders, a filter and a limiter -
+  // measured on an iPhone XR as `B128` in the dev readout where Android reports 2048. The word it
+  // does honour is the category, and 'playback' is defined as the largest buffer the implementation
+  // will give: the same request in the only vocabulary that engine reads. Everywhere else the
+  // number is kept, because it names 2048 exactly rather than whatever a browser decides 'playback'
+  // means.
+  try { AC = new Ctor({ latencyHint: webkit ? 'playback' : OUT_LATENCY }); }
   catch (e) { AC = new Ctor(); }        // Safari before 14 has no option bag
 
   // Insurance, not a sound. Three files at -18 LUFS through these trims sit near -8 dBFS, so this
@@ -11335,11 +11367,6 @@ function makeEl(loop) {
   const el = new Audio();
   el.loop = !!loop;
   el.preload = 'auto';
-  // A drift correction is a resample, not a time-stretch. At 0.3 % the difference is academic, but
-  // stretching is the more expensive of the two and there is no reason to ask for it.
-  if ('preservesPitch' in el) el.preservesPitch = false;
-  else if ('mozPreservesPitch' in el) el.mozPreservesPitch = false;
-  else if ('webkitPreservesPitch' in el) el.webkitPreservesPitch = false;
   el.addEventListener('error', function () { fail('load ' + (el.currentSrc || el.src || '?')); });
   // A stem that has only just become playable has to be let into the mix, and the mix is only
   // recomputed when the meter moves - which it may not do for a while. So readiness re-applies it.
@@ -11358,14 +11385,15 @@ function srcFor(name) {
 }
 
 // A stem that is handed its source while the loop is already running must not start at zero: it
-// would be minutes out of step with the others and the watchdog would drag it back with seeks -
-// harmless, because the meter has not asked for it yet and nobody can hear it, but it reads in the
-// diagnostics as twelve seconds of drift and three seeks, which is a fault report for something
-// that is not a fault. Putting it where the leader is, the moment it knows its own length, is the
-// same result with nothing to explain.
+// would be minutes out of step with the others, and though nobody can hear it yet - the meter has
+// not asked for it - it reads in the diagnostics as twelve seconds of drift, which is a fault
+// report for something that is not a fault. Put where the leader is the moment it knows its own
+// length, and through the same compensated seek the watchdog uses, so that a first seek onto a
+// cold buffer does not leave it one seek-length behind.
 function syncNewStem(el) {
-  if (!running || stemEl.indexOf(el) < 1) return;
-  const go = function () { try { el.currentTime = stemEl[0].currentTime; } catch (e) {} };
+  const i = stemEl.indexOf(el);
+  if (!running || i < 1) return;
+  const go = function () { seekStem(i, SEEK_TRIES); };
   if (el.readyState >= 1) go();
   else el.addEventListener('loadedmetadata', go, { once: true });
 }
@@ -11457,21 +11485,28 @@ function applySuspicion(force) {
   }
   color.frequency.setTargetAtTime(11000 * Math.pow(2600 / 11000, suspicion / 100), t, .9);
 }
-// A stem that is still downloading cannot carry its share of the mix, and handing it that share
-// anyway is a hole in the music - at Suspicion 30 the whole weight is on middle, so a middle that
-// has not arrived is silence. Its share goes to whichever stems can play instead, which on the way
-// up means the previous arrangement simply stays put until its successor is there. When the
-// successor arrives its `canplay` re-applies this and the ordinary 0.9 s crossfade takes over.
+// Two reasons a stem cannot carry its share of the mix, and they get one answer because they are
+// the same problem: it has not downloaded, or the drift watchdog has found it too far out of step
+// to layer. Either way the arrangement is better one layer thin than wrong.
+function canCarry(i) { return !!stemEl[i] && stemEl[i].readyState >= 3 && !driftMuted[i]; }
+
+// Handing a stem a share it cannot carry is a hole in the music - at Suspicion 30 the whole weight
+// is on middle, so a middle that has not arrived is silence. Its share goes to whichever stems can
+// play instead, which on the way up means the previous arrangement simply stays put until its
+// successor is there. When the successor arrives its `canplay` re-applies this and the ordinary
+// 0.9 s crossfade takes over.
 //
-// If nothing at all can play - the first seconds of a slow connection - the weights are left alone
-// rather than zeroed, because zeroing them is the same silence with a fade on it.
+// If nothing at all can play - the first seconds of a slow connection, or a lone stem the watchdog
+// has dropped - the weights are left alone rather than zeroed, because zeroing them is the same
+// silence with a fade on it. That failsafe is also what makes dropping a stem safe: a stem nothing
+// else can replace is never actually taken away.
 function readyWeights(w) {
   let want = 0, have = 0;
-  for (let i = 0; i < 3; i++) { want += w[i]; if (stemEl[i] && stemEl[i].readyState >= 3) have += w[i]; }
+  for (let i = 0; i < 3; i++) { want += w[i]; if (canCarry(i)) have += w[i]; }
   if (have < .001) return w;
   if (have >= want - .001) return w;
   const k = want / have;
-  return [0, 1, 2].map(i => (stemEl[i] && stemEl[i].readyState >= 3 ? w[i] * k : 0));
+  return [0, 1, 2].map(i => (canCarry(i) ? w[i] * k : 0));
 }
 
 function setSuspicion(v) { suspicion = clamp(v, 0, 100); applySuspicion(); }
@@ -11518,11 +11553,11 @@ function play(fromSec) {
   // start point handed in by a harness cannot land inside the wrap.
   const dur = stemEl.length && stemEl[0].duration ? stemEl[0].duration : 480;
   const from = clamp(fromSec || 0, 0, Math.max(0, dur - 1));
-  driftWorst = 0; driftSeeks = 0;
+  resetDrift();
   running = true;
   seekAll(from, function () {
     if (!running) return;                       // a theme or a stop landed while the seek was out
-    for (const el of stemEl) if (el.src) { el.playbackRate = 1; el.play().catch(function () {}); }
+    for (const el of stemEl) if (el.src) el.play().catch(function () {});
     const t = AC.currentTime;
     musicOut.gain.cancelScheduledValues(t);
     musicOut.gain.setValueAtTime(.0001, t);
@@ -11552,7 +11587,57 @@ function posSec() { return stemEl.length ? stemEl[0].currentTime : 0; }
 // ---------------------------------------------------------------------------
 // 5b. The drift watchdog. See DRIFT_* above for the thresholds and why they are those.
 // ---------------------------------------------------------------------------
-let driftWorst = 0, driftSeeks = 0;
+let driftWorst = 0, driftSeeks = 0, driftDrops = 0;
+let driftOn = true;                        // the dev panel's A/B switch
+const seekHold   = [0, 0, 0];              // performance.now() until which a stem is left alone
+const seekBias   = [0, 0, 0];              // measured cost of a seek on this element, in seconds
+const driftMuted = [false, false, false];  // dropped from the mix because it cannot be layered
+const seekTok    = [0, 0, 0];              // only the newest seek per stem is timed and answered
+
+// Which stem the others are put in step with, and it is whichever one is loudest rather than
+// always stem 0. The reference has to be a clock that is definitely still running, and a fixed
+// leader is not one: above Suspicion 22 heaven is silent for the rest of the session, and iOS lets
+// a media element nobody appears to be listening to run its buffer dry. A fixed leader therefore
+// means the two stems that ARE playing get seeked to a position that stopped advancing minutes
+// ago. The loudest stem is by definition the one the device is really decoding.
+let leadIdx = 0, lastLeadIdx = -1, lastLeadPos = -1, lastLeadAt = 0;
+
+function resetDrift() {
+  driftWorst = 0; driftSeeks = 0; driftDrops = 0;
+  leadIdx = 0; lastLeadIdx = -1; lastLeadPos = -1; lastLeadAt = 0;
+  for (let i = 0; i < 3; i++) { seekHold[i] = 0; seekBias[i] = 0; driftMuted[i] = false; seekTok[i]++; }
+}
+
+function pickLead() {
+  let best = -1, bestGain = -1;
+  for (let i = 0; i < 3; i++) {
+    const el = stemEl[i];
+    if (!el || !el.src || el.paused || !el.duration) continue;
+    const g = stemGain[i] ? stemGain[i].gain.value : 0;
+    if (g > bestGain) { bestGain = g; best = i; }
+  }
+  return best < 0 ? 0 : best;
+}
+
+// One stem can wrap a tick before another, which reads as eight minutes of drift rather than the
+// few milliseconds it is. Folded into the half-loop either side of zero before it is judged.
+function foldDrift(d, dur) {
+  if (!(dur > 1)) return d;
+  while (d > dur / 2) d -= dur;
+  while (d < -dur / 2) d += dur;
+  return d;
+}
+
+// Whether a stem is in the room, and both halves are load-bearing. `busTarget` catches the rising
+// edge, where the meter has asked for a stem the 0.9 s ramp has not brought up yet. The bus gain
+// catches the falling one, where the target is already zero and the ramp - exponential, so it
+// approaches rather than arrives - is still seconds of audible tail short of it. Reading only the
+// target is what let a stem still carrying the mix be classified as silent and spliced.
+function stemHeard(i) {
+  if (busTarget[i] >= .02) return true;
+  const g = stemGain[i];
+  return !!g && g.gain.value > HEARD_GAIN * MUSIC_TRIM;
+}
 
 function startDrift() {
   if (driftTimer) return;
@@ -11560,36 +11645,93 @@ function startDrift() {
 }
 function stopDrift() {
   clearInterval(driftTimer); driftTimer = null;
-  for (const el of stemEl) el.playbackRate = 1;
 }
 
+// A seek on a silent stem, aimed where the leader WILL be rather than where it is.
+//
+// Setting `currentTime` is not instantaneous on WebKit: the media pipeline is flushed and refilled,
+// and the leader plays on throughout. Aimed at the leader's position now, the stem lands exactly
+// one seek-length late; the next tick measures that and seeks again; the correction never
+// converges. On an iPhone XR that read as 468 ms of drift and eight seeks inside the first twenty
+// seconds of a run - a splice every couple of seconds - which is what sent this section back for a
+// rewrite. So the aim carries the last measured cost of a seek on this element, and whatever is
+// left over when it lands is re-measured and spent on one more try.
+function seekStem(i, tries) {
+  const el = stemEl[i], ref = stemEl[leadIdx];
+  if (!el || !el.src || !el.duration || i === leadIdx || !ref) return;
+  const dur = el.duration, t0 = performance.now();
+  let target = ref.currentTime + seekBias[i];
+  if (!isFinite(target)) return;
+  while (target >= dur) target -= dur;
+  seekHold[i] = t0 + SEEK_COOL;
+  driftSeeks++;
+  const tok = ++seekTok[i];
+  el.addEventListener('seeked', function () {
+    if (seekTok[i] !== tok) return;
+    // Averaged rather than replaced: one slow seek onto an empty buffer should move the aim, not
+    // become it.
+    seekBias[i] = clamp((seekBias[i] + (performance.now() - t0) / 1000) / 2, 0, .5);
+    seekHold[i] = performance.now() + SEEK_COOL;
+    if (tries <= 1 || !running || stemHeard(i) || i === leadIdx) return;
+    if (Math.abs(foldDrift(el.currentTime - stemEl[leadIdx].currentTime, dur)) >= DRIFT_DEAD) seekStem(i, tries - 1);
+  }, { once: true });
+  try { el.currentTime = target; } catch (e) {}
+}
+
+// Dropping a stem out of the mix, which is the move `readyWeights` already makes for one that has
+// not downloaded: its share goes to whoever can carry it and the arrangement thins by a layer.
+// Reached only where two stems are audible and too far apart to leave alone - a missing layer is
+// worse than a present one and much better than a doubled one, and it is the only answer left that
+// does not put a splice into something somebody is listening to. The stem comes back through the
+// ordinary 0.9 s fade once it has been put in step in silence.
+function driftMute(i) { driftMuted[i] = true; driftDrops++; applySuspicion(true); }
+function driftUnmute(i) { driftMuted[i] = false; applySuspicion(true); }
+
+// The rule, and it is not the rule this file shipped with: a stem anybody can hear is never
+// touched. Not seeked, not resampled. Both of those are silent on Chrome and audible on WebKit,
+// where a media element behind a MediaElementAudioSourceNode is a platform pipeline that either
+// one flushes - which is why the same build was clean on Android and crackled on every iPhone.
+//
+// It is affordable because an offset only exists when there is something to hear it against.
+// Below two audible arrangements there is no flam: a stem playing alone IS the timeline, whatever
+// its own clock says about it. And every stem is silent for minutes before the crossfade that
+// calls it in, which is all the room a correction needs. So corrections happen out of earshot and
+// the mix finds the stem already in step.
 function checkDrift() {
-  if (!running || stemEl.length < 3 || stemEl[0].paused) return;
-  const dur = stemEl[0].duration;
-  const lead = stemEl[0].currentTime;
-  for (let i = 1; i < 3; i++) {
+  if (!driftOn || !running || stemEl.length < 3) return;
+  const now = performance.now();
+  leadIdx = pickLead();
+  const ref = stemEl[leadIdx];
+  if (!ref || !ref.src || ref.paused || !ref.duration) return;
+  const dur = ref.duration, lead = ref.currentTime;
+  if (driftMuted[leadIdx]) driftUnmute(leadIdx);
+  // A reference that is not moving is not a reference. If the leader has stalled - a buffer run
+  // dry, a decoder the OS has throttled - then every offset measured against it this tick is that
+  // stall and not a drift, and seeking the other two to a frozen position is how one element's
+  // stall becomes the whole mix's. Sit the tick out and let it come back.
+  const elapsed = (now - lastLeadAt) / 1000;
+  const moved = Math.abs(foldDrift(lead - lastLeadPos, dur));
+  const stalled = leadIdx === lastLeadIdx && lastLeadPos >= 0 && elapsed > .5 && moved < elapsed * .5;
+  lastLeadIdx = leadIdx; lastLeadPos = lead; lastLeadAt = now;
+  if (stalled) return;
+  let heard = 0;
+  for (let i = 0; i < 3; i++) if (stemHeard(i)) heard++;
+  for (let i = 0; i < 3; i++) {
     const el = stemEl[i];
-    if (!el.src || el.paused || !el.duration) continue;
-    // One stem can wrap a tick before another, which reads as eight minutes of drift rather than
-    // the few milliseconds it is. Folded into the half-loop either side of zero before it is
-    // judged, so a wrap costs nothing.
-    let d = el.currentTime - lead;
-    if (dur > 1) { while (d > dur / 2) d -= dur; while (d < -dur / 2) d += dur; }
-    const mag = Math.abs(d);
-    // Counted only while the meter is actually asking for this stem. A stem still downloading
-    // behind the one that is playing falls arbitrarily far behind and is put back with a free
-    // seek, and reporting that as drift would make an ordinary slow connection read like a fault
-    // in the crossfade. The number is meant to answer "are the arrangements anyone can hear still
-    // one piece of music", so that is what it measures.
-    const audible = busTarget[i] >= .02;
-    if (audible && mag > driftWorst) driftWorst = mag;
-    if (mag < DRIFT_DEAD) { el.playbackRate = 1; continue; }
-    if (mag > DRIFT_HARD || !audible) {
-      el.playbackRate = 1;
-      try { el.currentTime = lead; if (audible) driftSeeks++; } catch (e) {}
+    if (i === leadIdx || !el.src || el.paused || !el.duration) continue;
+    const mag = Math.abs(foldDrift(el.currentTime - lead, dur));
+    const audible = stemHeard(i);
+    // Reported only where it means something. The number answers "are the arrangements anyone can
+    // hear still one piece of music", and a lone stem's offset from a leader nobody can hear is
+    // not drift in any sense a listener would recognise.
+    if (audible && heard > 1 && mag > driftWorst) driftWorst = mag;
+    if (driftMuted[i] && mag < DRIFT_DEAD) driftUnmute(i);
+    if (audible) {
+      if (heard > 1 && mag > DRIFT_HARD && !driftMuted[i]) driftMute(i);
       continue;
     }
-    el.playbackRate = 1 - clamp(d / 4, -DRIFT_RATE, DRIFT_RATE);
+    if (now < seekHold[i] || mag < DRIFT_DEAD) continue;
+    seekStem(i, SEEK_TRIES);
   }
 }
 
@@ -11878,6 +12020,16 @@ return {
    *  crossfade: it is the only way to hear a stem the meter is not currently asking for. */
   solo(i) { solo = (i === undefined || i === null) ? -1 : (i | 0); applySuspicion(true); return this; },
 
+  /** The drift watchdog on or off, for an A/B on a device that is crackling. Returns the new
+   *  state rather than `this`, because the dev panel labels its own button with it. Switching it
+   *  off also releases any stem the watchdog has dropped, so what is heard afterwards is the mix
+   *  with nothing at all intervening. */
+  drift(on) {
+    driftOn = on === undefined ? !driftOn : !!on;
+    if (!driftOn) for (let i = 0; i < 3; i++) if (driftMuted[i]) driftUnmute(i);
+    return driftOn;
+  },
+
   /** Present so that a caller holding either player can call them without asking which it is.
    *  Nothing in the file path has tiers, a hall or a channel count to cull. */
   quality() { return this; },
@@ -11892,10 +12044,12 @@ return {
       pos: posSec(), total: stemEl.length && stemEl[0].duration ? stemEl[0].duration : 0,
       suspicion, bank: bankLoad, failed: failed, failReason: failReason,
       stage: stageIdx,
-      // The two numbers that say whether the three elements are still one piece of music: the
-      // worst offset seen since the loop started, in ms, and how many times a stem had to be
-      // seeked back rather than walked back.
-      drift: Math.round(driftWorst * 1000), seeks: driftSeeks,
+      // What the three elements are doing to each other. `drift` is the worst offset in ms seen
+      // while two arrangements were audible at once - the only condition under which an offset is
+      // a thing anybody can hear. `seeks` counts corrections, all of which now happen on a silent
+      // stem, so it is a load-and-crossfade number rather than a fault. `drops` is the one to
+      // watch: a stem the watchdog could not bring into step and had to take out of the mix.
+      drift: Math.round(driftWorst * 1000), seeks: driftSeeks, drops: driftDrops, driftOn: driftOn,
       solo: solo,
       gains: stemGain.map(g => g.gain.value),
       sampleRate: AC ? AC.sampleRate : 0,
@@ -12323,7 +12477,13 @@ function initAudio(){
   // give - on Android that can be 256 frames, about 5 ms, and any stall longer than 5 ms on the
   // audio thread is an audible tear. Nothing in this game needs 5 ms. See OUT_LATENCY for what is
   // asked for instead and why that number.
-  try { AC = new Ctor({ latencyHint: OUT_LATENCY }); }
+  // Before the context, because the session is chosen when the context opens - and it answers
+  // true only on WebKit, which does not honour a latency given in seconds. An iPhone asked for
+  // OUT_LATENCY hands back 128 frames; 'playback' is the same request in the vocabulary that
+  // engine does read, being defined as the largest buffer the implementation will give. See the
+  // twin of this comment in 97_audio_files.js, where it was measured.
+  const webkit = claimPlaybackAudioSession();
+  try { AC = new Ctor({ latencyHint: webkit ? 'playback' : OUT_LATENCY }); }
   catch (e) { AC = new Ctor(); }         // Safari before 14 has no option bag
   buildWaves();
 
@@ -13204,6 +13364,10 @@ return {
    *  is. This one synthesises every cue and has nothing to load up front. */
   bank(){ return this; },
   bankState(){ return 'ready'; },
+
+  /** Also present only so either player answers it. There are no media elements here and so no
+   *  three clocks to keep together; the watchdog it toggles belongs to the other file. */
+  drift(){ return false; },
 
   /** Ending theme: 'victory' (day 10 survived) or 'defeat' (Suspicion 100).
    *  Stops the loop by itself. */
